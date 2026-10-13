@@ -4,6 +4,12 @@
 
 A native macOS menu bar app for AI subscription quotas and local token usage.
 
+[Download the latest release](https://github.com/saga029/Aicost/releases/latest) · [Interface previews](#interface-previews) · [Build from source](#build-and-test)
+
+![Aicost usage analysis: daily stacked usage, costs and usage share by app, with demo data](docs/images/en-analysis.png)
+
+All interface previews use synthetic demo data. They contain no real account or usage history.
+
 ## Requirements
 
 - Apple Silicon Mac, macOS 15 or newer.
@@ -23,6 +29,22 @@ Download **Aicost-1.0.1-macos-arm64.zip** from [Releases](https://github.com/sag
 - English and Simplified Chinese, with responsive quota cards.
 - Daily grouping and reset times follow the device's current time zone, including daylight saving time. App error messages follow the selected interface language.
 - Local history, manual refresh and launch-at-login settings.
+
+## Interface previews
+
+### Menu bar summary
+
+Check remaining quotas, today's tokens and estimated cost without opening the dashboard.
+
+<p align="center">
+  <img src="docs/images/en-menu.png" width="400" alt="Aicost menu bar summary with demo quotas and today's usage">
+</p>
+
+### Subscription quotas
+
+Compare providers, inspect individual quota windows and see reset times in the device's current time zone.
+
+![Aicost subscription quotas: provider overview, remaining percentages and reset times, with demo data](docs/images/en-quotas.png)
 
 ## Build and test
 

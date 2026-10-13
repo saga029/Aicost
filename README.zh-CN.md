@@ -4,6 +4,12 @@
 
 原生 macOS 菜单栏 AI 订阅额度与本机 Token 用量分析工具。
 
+[下载最新版](https://github.com/saga029/Aicost/releases/latest) · [界面预览](#界面预览) · [源码构建](#构建)
+
+![Aicost 用量分析：每日堆叠用量、费用与各应用占比，使用示例数据](docs/images/zh-CN-analysis.png)
+
+所有界面图均使用虚构示例数据，不含真实账号或个人用量历史。
+
 ## 下载与安装
 
 需要 **Apple Silicon / macOS 15+**。从 [Releases](https://github.com/saga029/Aicost/releases) 下载 `Aicost-1.0.1-macos-arm64.zip`，解压后将 `Aicost.app` 放入应用程序目录。本次版本采用临时签名，尚未通过 Apple 公证，首次启动可能需要通过 Finder 或系统“隐私与安全性”批准打开。
@@ -15,6 +21,22 @@
 - 今天、本月、近 7/30 天与最长 31 天的自定义区间。
 - 中英文界面、自适应额度卡片、本机历史、手动刷新与登录后启动。
 - 日统计和重置时间跟随设备当前时区，支持夏令时；应用错误提示跟随界面语言。
+
+## 界面预览
+
+### 菜单栏速览
+
+查看各服务的剩余额度、今日 Token 与估算费用，直接进入用量分析或订阅额度。
+
+<p align="center">
+  <img src="docs/images/zh-CN-menu.png" width="400" alt="Aicost 菜单栏摘要，显示虚构配额与今日用量">
+</p>
+
+### 订阅额度
+
+汇总各服务额度，展开查看不同周期的剩余比例，以及设备当前时区下的重置时间。
+
+![Aicost 订阅额度：服务汇总、剩余比例与重置时间，使用示例数据](docs/images/zh-CN-quotas.png)
 
 ## 构建
 
