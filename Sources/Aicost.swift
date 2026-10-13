@@ -427,6 +427,11 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         settings.objectWillChange.sink { [weak self] _ in
             DispatchQueue.main.async { self?.applySettings() }
         }.store(in: &subscriptions)
+        for name in [Notification.Name.NSSystemTimeZoneDidChange, .NSCalendarDayChanged] {
+            NotificationCenter.default.publisher(for: name).sink { [weak self] _ in
+                Task { @MainActor [weak self] in await self?.usage.checkRealtimeActivity() }
+            }.store(in: &subscriptions)
+        }
         applySettings()
         startActivityMonitor()
         if CommandLine.arguments.contains("--open") {
@@ -534,7 +539,7 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             return "\(provider.name) · \(planText)\n\(metricsText)"
         }.joined(separator: "\n\n")
         button.setAccessibilityLabel(settings.t("Aicost · 订阅额度与今日用量", "Aicost · Subscription Quotas & Today"))
-        button.setAccessibilityHelp(usage.providers.isEmpty ? (usage.errorMessage ?? settings.t("正在读取本机用量", "Reading local usage")) : quotaHelp)
+        button.setAccessibilityHelp(usage.providers.isEmpty ? (usage.error?.message(isEnglish: settings.isEnglish) ?? settings.t("正在读取本机用量", "Reading local usage")) : quotaHelp)
         updateStatusToolTip()
         button.needsDisplay = true
     }
@@ -696,8 +701,6 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
 
 struct Metric: Identifiable {
     let id: String
-    let name: String
-    let detail: String
     let remaining: Double?
     let reset: Date?
     var isFiveHour: Bool = false
@@ -740,7 +743,8 @@ final class UsageStore: ObservableObject {
     @Published var availableProviders: [String] = ["codex", "claude", "cursor", "grok", "antigravity"]
     @Published var lastUpdated: Date?
     @Published var isRefreshing = false
-    @Published var errorMessage: String?
+    @Published var error: UsageDiagnostic?
+    @Published private(set) var calendarContext = HistoryAnalyzer.zone.identifier + "|" + HistoryAnalyzer.dayFormatter.string(from: Date())
     @Published var apiConnected = false
     var onRefresh: (() -> Void)?
     private var lastAPIData: Data?
@@ -751,7 +755,7 @@ final class UsageStore: ObservableObject {
 
     init() {
         let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
-        let archive = HistoryAnalyzer.storageFolder(support: support).appendingPathComponent("history-v1.json")
+        let archive = HistoryAnalyzer.archiveURL(support: support)
         if let data = try? Data(contentsOf: archive),
            let prior = try? JSONDecoder().decode(HistoryResult.self, from: data) {
             self.history = prior
@@ -773,7 +777,7 @@ final class UsageStore: ObservableObject {
     func snapshot(fromDate: Date, throughDate: Date, provider: String, rangePreset: Int) -> AnalysisSnapshot {
         let fKey = HistoryAnalyzer.dayFormatter.string(from: fromDate)
         let tKey = HistoryAnalyzer.dayFormatter.string(from: throughDate)
-        let key = "\(fKey)|\(tKey)|\(provider)|\(rangePreset)|\(history.days.count)"
+        let key = "\(calendarContext)|\(fKey)|\(tKey)|\(provider)|\(rangePreset)|\(history.days.count)"
         if let cached = snapshotCache[key] {
             return cached
         }
@@ -809,6 +813,10 @@ final class UsageStore: ObservableObject {
     }
 
     func checkRealtimeActivity() async {
+        if updateCalendarContext() {
+            await refresh(force: true)
+            return
+        }
         guard !isRefreshing else { return }
         let signature = await Task.detached(priority: .utility) { Self.activitySignature() }.value
         if lastActivitySignature.isEmpty {
@@ -819,6 +827,20 @@ final class UsageStore: ObservableObject {
         guard Date().timeIntervalSince(lastForceRefreshAt) >= 12 else { return }
         lastActivitySignature = signature
         await refresh(force: true)
+    }
+
+    @discardableResult private func updateCalendarContext() -> Bool {
+        let zone = HistoryAnalyzer.zone.identifier
+        let context = zone + "|" + HistoryAnalyzer.dayFormatter.string(from: Date())
+        guard context != calendarContext else { return false }
+        if !calendarContext.hasPrefix(zone + "|") {
+            // Do not show daily totals from the previous zone during the rescan.
+            history = HistoryResult(days: [], sources: [:], updatedAt: .distantPast, warnings: [], timeZoneIdentifier: zone)
+        }
+        calendarContext = context
+        prewarmSnapshots()
+        onRefresh?()
+        return true
     }
 
     nonisolated private static func activitySignature() -> String {
@@ -879,7 +901,8 @@ final class UsageStore: ObservableObject {
             if force { pendingForceRefresh = true }
             return
         }
-        isRefreshing = true; errorMessage = nil
+        updateCalendarContext()
+        isRefreshing = true; error = nil
         if force { lastForceRefreshAt = Date() }
         do {
             let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/runway")
@@ -912,7 +935,6 @@ final class UsageStore: ObservableObject {
                 default: order = ["session", "daily", "weekly", "chat", "completions", "premiumRequests"]
                 }
                 order = order.filter { resources[$0] != nil } + resources.keys.filter { !order.contains($0) }.sorted()
-                let names = ["daily": "每日", "chat": "聊天额度", "completions": "代码补全", "premiumRequests": "高级请求", "totalUsage": "总额度", "autoUsage": "Cursor 模型", "apiUsage": "其他模型", "session": "5h内额度", "weekly": "每周", "geminiSession": "Gemini · 5h内额度", "geminiWeekly": "Gemini · 每周", "nonGeminiSession": "Claude · 5h内额度", "nonGeminiWeekly": "Claude · 每周"]
                 let metrics = order.compactMap { id -> Metric? in
                     guard let value = resources[id], let remaining = value["remaining"] as? Double else { return nil }
                     let limit = value["limit"] as? Double ?? 100
@@ -920,9 +942,7 @@ final class UsageStore: ObservableObject {
                     let windowSeconds = (value["windowSeconds"] as? NSNumber)?.intValue
                     let isFiveHour = windowSeconds == 18000 || id.lowercased().contains("session")
                     let reset = (value["resetsAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                    return Metric(id: id, name: names[id] ?? id,
-                                  detail: "剩余 \(Int((ratio * 100).rounded()))% · 已用 \(Int(((1 - ratio) * 100).rounded()))%",
-                                  remaining: ratio, reset: reset, isFiveHour: isFiveHour)
+                    return Metric(id: id, remaining: ratio, reset: reset, isFiveHour: isFiveHour)
                 }
                 let fetchedAt = (row["fetchedAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
                 return ProviderUsage(id: key, name: providerNames[key] ?? row["displayName"] as? String ?? key, plan: row["plan"] as? String, metrics: metrics, stale: row["stale"] as? Bool ?? false, fetchedAt: fetchedAt)
@@ -930,7 +950,7 @@ final class UsageStore: ObservableObject {
             rebuildAvailableProviders()
             lastUpdated = (root["generatedAt"] as? String).flatMap(HistoryAnalyzer.parseDate) ?? Date()
             onRefresh?()
-        } catch { errorMessage = "额度读取失败，已保留上次结果。可在设置里重新扫描。" }
+        } catch { self.error = .quotaReadFailed }
         do {
             var request = URLRequest(url: URL(string: "http://127.0.0.1:6736/v1/usage")!); request.timeoutInterval = 4
             let (data, response) = try await URLSession.shared.data(for: request)
@@ -946,7 +966,13 @@ final class UsageStore: ObservableObject {
             mergeNewerOpenUsageQuotas(rows)
         } catch { apiConnected = false }
         let data = lastAPIData
-        history = await Task.detached(priority: .utility) { HistoryAnalyzer.collect(apiData: data) }.value
+        let collected = await Task.detached(priority: .utility) { HistoryAnalyzer.collect(apiData: data) }.value
+        updateCalendarContext()
+        if collected.timeZoneIdentifier == HistoryAnalyzer.zone.identifier {
+            history = collected
+        } else {
+            pendingForceRefresh = true
+        }
         rebuildAvailableProviders()
         prewarmSnapshots()
         isRefreshing = false
@@ -958,11 +984,11 @@ final class UsageStore: ObservableObject {
     }
 
     private func mergeNewerOpenUsageQuotas(_ rows: [[String: Any]]) {
-        let labelMap: [String: [String: (String, String)]] = [
-            "cursor": ["total usage": ("totalUsage", "总额度"), "cursor models": ("autoUsage", "Cursor 模型"), "other models": ("apiUsage", "其他模型")],
-            "codex": ["session": ("session", "5h内额度"), "weekly": ("weekly", "每周")],
-            "grok": ["weekly limit": ("weekly", "每周"), "weekly": ("weekly", "每周")],
-            "antigravity": ["session": ("geminiSession", "Gemini · 5h内额度"), "weekly": ("geminiWeekly", "Gemini · 每周"), "claude": ("nonGeminiSession", "Claude · 5h内额度"), "claude weekly": ("nonGeminiWeekly", "Claude · 每周")]
+        let labelMap: [String: [String: String]] = [
+            "cursor": ["total usage": "totalUsage", "cursor models": "autoUsage", "other models": "apiUsage"],
+            "codex": ["session": "session", "weekly": "weekly"],
+            "grok": ["weekly limit": "weekly", "weekly": "weekly"],
+            "antigravity": ["session": "geminiSession", "weekly": "geminiWeekly", "claude": "nonGeminiSession", "claude weekly": "nonGeminiWeekly"]
         ]
         var updated = providers
         var changed = false
@@ -982,11 +1008,9 @@ final class UsageStore: ObservableObject {
                 let limit = line["limit"] as? Double ?? 100
                 let ratio = limit > 0 ? max(0, min(1, (limit - used) / limit)) : 0
                 let periodMs = (line["periodDurationMs"] as? NSNumber)?.intValue
-                let isFiveHour = periodMs == 18_000_000 || mapped.0.lowercased().contains("session")
+                let isFiveHour = periodMs == 18_000_000 || mapped.lowercased().contains("session")
                 let reset = (line["resetsAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                return Metric(id: mapped.0, name: mapped.1,
-                              detail: "剩余 \(Int((ratio * 100).rounded()))% · 已用 \(Int(((1 - ratio) * 100).rounded()))%",
-                              remaining: ratio, reset: reset, isFiveHour: isFiveHour)
+                return Metric(id: mapped, remaining: ratio, reset: reset, isFiveHour: isFiveHour)
             }
             guard !metrics.isEmpty else { continue }
             updated[idx] = ProviderUsage(id: existing.id, name: existing.name, plan: (row["plan"] as? String) ?? existing.plan, metrics: metrics, stale: false, fetchedAt: fetched)
@@ -1133,8 +1157,8 @@ struct QuickSummaryView: View {
             }
 
             if usage.providers.isEmpty {
-                if let error = usage.errorMessage {
-                    Text(error).font(.caption).foregroundStyle(.red).padding(.vertical, 8)
+                if let error = usage.error {
+                    Text(error.message(isEnglish: settings.isEnglish)).font(.caption).foregroundStyle(.red).padding(.vertical, 8)
                 } else {
                     ProgressView(settings.t("正在读取账户…", "Loading accounts…")).frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
@@ -1535,7 +1559,7 @@ struct CalendarPickerPopover: View {
     @State private var displayedMonth: Date
     @State private var hoveredDay: Date?
 
-    private let cal = HistoryAnalyzer.calendar
+    private var cal: Calendar { HistoryAnalyzer.calendar }
     private var weekdays: [String] {
         settings.isEnglish ? ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"] : ["日", "一", "二", "三", "四", "五", "六"]
     }
@@ -1952,6 +1976,7 @@ struct AnalysisView: View {
     @State private var showFromPicker = false
     @State private var showThroughPicker = false
     @State private var initializedRange = false
+    @State private var selectionTimeZone = HistoryAnalyzer.zone.identifier
     @Binding var provider: String
 
     var body: some View {
@@ -1991,6 +2016,22 @@ struct AnalysisView: View {
                 applyRange(settings.defaultRange)
                 initializedRange = true
             }
+        }
+        .onChange(of: usage.calendarContext) { _, _ in
+            showFromPicker = false
+            showThroughPicker = false
+            let newZone = HistoryAnalyzer.zone.identifier
+            if rangePreset >= 0 {
+                applyRange(rangePreset)
+            } else if newZone != selectionTimeZone,
+                      let oldZone = TimeZone(identifier: selectionTimeZone) {
+                // Custom ranges represent calendar dates, not absolute instants.
+                let oldCalendar = HistoryAnalyzer.calendar(timeZone: oldZone)
+                let newCalendar = HistoryAnalyzer.calendar
+                fromDate = newCalendar.date(from: oldCalendar.dateComponents([.year, .month, .day], from: fromDate)) ?? fromDate
+                throughDate = newCalendar.date(from: oldCalendar.dateComponents([.year, .month, .day], from: throughDate)) ?? throughDate
+            }
+            selectionTimeZone = newZone
         }
     }
 
@@ -2177,8 +2218,8 @@ struct AnalysisView: View {
         }
     }
     @ViewBuilder private var sourceNotes: some View {
-        if let error = usage.errorMessage {
-            Text(error).font(.system(size: 10)).foregroundStyle(.orange)
+        if let error = usage.error {
+            Text(error.message(isEnglish: settings.isEnglish)).font(.system(size: 10)).foregroundStyle(.orange)
         }
     }
     private func metric(_ title: String, icon: String, tint: Color, value: String, sub: String) -> some View {
@@ -3091,8 +3132,8 @@ struct QuotaView: View {
         GeometryReader { geometry in
             ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if let error = usage.errorMessage {
-                    Text(error).font(.caption).foregroundStyle(.orange)
+                if let error = usage.error {
+                    Text(error.message(isEnglish: settings.isEnglish)).font(.caption).foregroundStyle(.orange)
                 }
                 overviewStrip
                 LazyVGrid(columns: [GridItem(.adaptive(minimum: 300), spacing: 16)], alignment: .leading, spacing: 16) {
@@ -3278,7 +3319,7 @@ struct SettingsView: View {
     @State private var login = false
     @State private var requiresApproval = false
     @State private var isSyncingLogin = false
-    @State private var loginError: String?
+    @State private var loginError: UsageDiagnostic?
 
     private func refreshLoginStatus() {
         let status = SMAppService.mainApp.status
@@ -3383,11 +3424,11 @@ struct SettingsView: View {
                             loginError = nil
                             refreshLoginStatus()
                         } catch {
-                            loginError = settings.t("登录项设置未完成：", "Failed to update login items: ") + error.localizedDescription
+                            loginError = .loginUpdateFailed
                             refreshLoginStatus()
                         }
                     }
-                if let loginError { Text(loginError).font(.caption).foregroundStyle(.orange) }
+                if let loginError { Text(loginError.message(isEnglish: settings.isEnglish)).font(.caption).foregroundStyle(.orange) }
                 if requiresApproval {
                     Button(settings.t("在系统设置中启用登录项", "Enable in System Settings")) { SMAppService.openSystemSettingsLoginItems() }
                 }
@@ -3408,7 +3449,7 @@ struct SettingsView: View {
                             HStack(spacing: 6) {
                                 Text("Aicost")
                                     .font(.system(size: 15, weight: .bold, design: .rounded))
-                                Text("v1.0")
+                                Text("v" + (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0.1"))
                                     .font(.system(size: 11, weight: .medium, design: .monospaced))
                                     .foregroundStyle(.secondary)
                                 Text(settings.t("MIT 开源", "MIT Open Source"))

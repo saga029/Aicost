@@ -6,7 +6,7 @@
 
 ## 下载与安装
 
-需要 **Apple Silicon / macOS 15+**。从 [Releases](https://github.com/saga029/Aicost/releases) 下载 `Aicost-1.0.0-macos-arm64.zip`，解压后将 `Aicost.app` 放入应用程序目录。本次版本采用临时签名，尚未通过 Apple 公证，首次启动可能需要通过 Finder 或系统“隐私与安全性”批准打开。
+需要 **Apple Silicon / macOS 15+**。从 [Releases](https://github.com/saga029/Aicost/releases) 下载 `Aicost-1.0.1-macos-arm64.zip`，解压后将 `Aicost.app` 放入应用程序目录。本次版本采用临时签名，尚未通过 Apple 公证，首次启动可能需要通过 Finder 或系统“隐私与安全性”批准打开。
 
 ## 功能
 
@@ -14,6 +14,7 @@
 - 每日堆叠用量、各应用占比、模型明细及 API 等价费用估算。
 - 今天、本月、近 7/30 天与最长 31 天的自定义区间。
 - 中英文界面、自适应额度卡片、本机历史、手动刷新与登录后启动。
+- 日统计和重置时间跟随设备当前时区，支持夏令时；应用错误提示跟随界面语言。
 
 ## 构建
 
@@ -34,9 +35,11 @@ python3 scripts/package.py
 
 Aicost 的历史缓存位于 `~/Library/Application Support/Aicost`，保存日期、模型与用量/费用数值，不保存会话正文或凭据值。发布源码和安装包不包含使用者的账户、用量历史或本机配置。详情见 [PRIVACY.md](PRIVACY.md)。
 
+1.0.1 为各设备时区分别保存日统计，并从仍可读取的带时间戳记录重新分组。旧 `history-v1.json` 保留在本机，其按固定时区汇总的日总量不会直接带入新分组；原始时间戳已不存在的记录无法重新分组。OpenUsage 仅提供日期的图表数据保留其原始日期。
+
 ## 当前限制
 
-日统计使用 Asia/Shanghai 时区；费用是可定价记录的 API 等价估算，不是订阅账单。日志移动或删除可能影响历史统计。部分错误诊断仍显示中文，目前仅支持简体中文与 English。
+费用是可定价记录的 API 等价估算，不是订阅账单。日志移动或删除可能影响历史统计。目前仅支持简体中文与 English。
 
 ## 开源
 

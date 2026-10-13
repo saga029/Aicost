@@ -29,6 +29,8 @@ def main():
     parser.add_argument("--output", type=pathlib.Path, default=ROOT / "build")
     arguments = parser.parse_args()
     version = (ROOT / "VERSION").read_text().strip()
+    major, minor, patch = map(int, version.split("."))
+    build_number = str(major * 10000 + minor * 100 + patch)
     output = arguments.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     app = output / "Aicost.app"
@@ -67,7 +69,7 @@ def main():
                 folder = contents / "Resources" / (language + ".lproj")
                 folder.mkdir()
                 (folder / "InfoPlist.strings").write_text('CFBundleName = "Aicost";\nCFBundleDisplayName = "Aicost";\n')
-            info = {"CFBundleName": "Aicost", "CFBundleDisplayName": "Aicost", "CFBundleIdentifier": "io.github.saga029.aicost", "CFBundleExecutable": "Aicost", "CFBundlePackageType": "APPL", "CFBundleIconFile": "AppIcon", "CFBundleShortVersionString": version, "CFBundleVersion": "100", "LSMinimumSystemVersion": "15.0", "LSUIElement": True, "NSHighResolutionCapable": True, "NSPrincipalClass": "NSApplication", "CFBundleDevelopmentRegion": "en", "CFBundleLocalizations": ["en", "zh-Hans"]}
+            info = {"CFBundleName": "Aicost", "CFBundleDisplayName": "Aicost", "CFBundleIdentifier": "io.github.saga029.aicost", "CFBundleExecutable": "Aicost", "CFBundlePackageType": "APPL", "CFBundleIconFile": "AppIcon", "CFBundleShortVersionString": version, "CFBundleVersion": build_number, "LSMinimumSystemVersion": "15.0", "LSUIElement": True, "NSHighResolutionCapable": True, "NSPrincipalClass": "NSApplication", "CFBundleDevelopmentRegion": "en", "CFBundleLocalizations": ["en", "zh-Hans"]}
             (contents / "Info.plist").write_bytes(plistlib.dumps(info))
         finally:
             run("hdiutil", "detach", mount)

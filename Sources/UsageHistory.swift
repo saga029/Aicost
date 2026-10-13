@@ -39,6 +39,27 @@ struct HistoryResult: Codable {
     var sources: [String: String]
     var updatedAt: Date
     var warnings: [String]
+    var timeZoneIdentifier: String? = nil
+}
+
+// Store diagnostic identities rather than language-specific text. The UI can
+// then change language immediately, even while an error is still displayed.
+enum UsageDiagnostic: String, Codable {
+    case quotaReadFailed
+    case loginUpdateFailed
+
+    func message(isEnglish: Bool) -> String {
+        switch self {
+        case .quotaReadFailed:
+            return isEnglish
+                ? "Could not read quotas. Previous results were kept. Try rescanning in Settings."
+                : "额度读取失败，已保留上次结果。可在设置里重新扫描。"
+        case .loginUpdateFailed:
+            return isEnglish
+                ? "Could not update launch at login. Try again or check Login Items in System Settings."
+                : "登录项设置未完成。请重试，或在系统设置的登录项中检查。"
+        }
+    }
 }
 
 struct UsageRecord: Codable {
@@ -168,21 +189,31 @@ struct PriceCatalog {
 }
 
 enum HistoryAnalyzer {
-    static let zone = TimeZone(identifier: "Asia/Shanghai")!
-    static var dayFormatter: DateFormatter {
-        let key = "Aicost.dayFormatter" as NSString
+    static var zone: TimeZone { .autoupdatingCurrent }
+    static var dayFormatter: DateFormatter { dayFormatter(timeZone: zone) }
+
+    static func dayFormatter(timeZone: TimeZone) -> DateFormatter {
+        let key = ("Aicost.dayFormatter." + timeZone.identifier) as NSString
         if let existing = Thread.current.threadDictionary[key] as? DateFormatter {
             return existing
         }
         let formatter = DateFormatter()
         formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = zone
+        formatter.timeZone = timeZone
         formatter.dateFormat = "yyyy-MM-dd"
         Thread.current.threadDictionary[key] = formatter
         return formatter
     }
-    static var calendar: Calendar {
-        var value = Calendar(identifier: .gregorian); value.timeZone = zone; return value
+    static var calendar: Calendar { calendar(timeZone: zone) }
+    static func calendar(timeZone: TimeZone) -> Calendar {
+        var value = Calendar(identifier: .gregorian); value.timeZone = timeZone; return value
+    }
+
+    static func archiveURL(support: URL, timeZone: TimeZone = zone) -> URL {
+        // Already grouped daily totals cannot be moved accurately to another
+        // time zone. Keep separate archives and reuse timestamped record caches.
+        let digest = SHA256.hash(data: Data(timeZone.identifier.utf8)).map { String(format: "%02x", $0) }.joined()
+        return storageFolder(support: support).appendingPathComponent("history-v2-\(digest).json")
     }
 
     static func storageFolder(support: URL) -> URL {
@@ -204,10 +235,12 @@ enum HistoryAnalyzer {
     }
 
     static func collect(apiData: Data?) -> HistoryResult {
+        // Freeze the zone for this scan if the device changes zones mid-refresh.
+        let collectionZone = TimeZone(identifier: zone.identifier) ?? .current
+        let dayFormatter = dayFormatter(timeZone: collectionZone)
         let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         let base = support.appendingPathComponent("OpenUsage")
-        let aicostDir = storageFolder(support: support)
-        let archive = aicostDir.appendingPathComponent("history-v1.json")
+        let archive = archiveURL(support: support, timeZone: collectionZone)
         let catalog = PriceCatalog(base: base.appendingPathComponent("pricing"))
         var merged: [String: UsageDay] = [:]
         var sources: [String: String] = [:]
@@ -226,7 +259,7 @@ enum HistoryAnalyzer {
                 let chart = lines.first { $0["type"] as? String == "barChart" }
                 for point in chart?["points"] as? [[String: Any]] ?? [] {
                     guard let label = point["label"] as? String, let total = point["value"] as? Double,
-                          let date = apiDate(label, reference: fetched) else { continue }
+                          let date = apiDate(label, reference: fetched, timeZone: collectionZone) else { continue }
                     let day = UsageDay(provider: provider, date: dayFormatter.string(from: date), total: total,
                                        cost: nil, requests: nil, detailed: false)
                     if merged[day.id]?.detailed != true {
@@ -234,7 +267,7 @@ enum HistoryAnalyzer {
                     }
                 }
                 if sources[provider] == nil {
-                    sources[provider] = "OpenUsage · " + dayFormatter.string(from: fetched)
+                    sources[provider] = "openusage"
                 }
             }
         }
@@ -276,10 +309,10 @@ enum HistoryAnalyzer {
                 }
             }
             if !records.isEmpty {
-                for day in aggregate(records, provider: provider) { merged[day.id] = day }
-                sources[provider] = "本机日志缓存 · " + (stamp.map { $0.formatted(date: .omitted, time: .shortened) } ?? "已读取")
+                for day in aggregate(records, provider: provider, timeZone: collectionZone) { merged[day.id] = day }
+                sources[provider] = "local-log-cache"
                 if cacheChanged, let stamp, Date().timeIntervalSince(stamp) > 300 {
-                    warnings.append((provider == "codex" ? "Codex" : "Grok") + " 日志有新记录，当前图表暂使用上次统计缓存。")
+                    warnings.append("logs-pending:" + provider)
                 }
             }
         }
@@ -294,9 +327,9 @@ enum HistoryAnalyzer {
                         cost: observedCodexPrices[recordKey(record)] ?? record.cost)
         }
         if !codexRecords.isEmpty {
-            for day in aggregate(codexRecords, provider: "codex") { merged[day.id] = day }
-            sources["codex"] = "Codex 本机日志 · 增量扫描"
-            warnings.removeAll { $0.hasPrefix("Codex") }
+            for day in aggregate(codexRecords, provider: "codex", timeZone: collectionZone) { merged[day.id] = day }
+            sources["codex"] = "codex-local-logs"
+            warnings.removeAll { $0 == "logs-pending:codex" }
         }
 
         let claude = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
@@ -327,24 +360,26 @@ enum HistoryAnalyzer {
             }
         }
         if !messages.isEmpty {
-            for day in aggregate(Array(messages.values), provider: "claude") { merged[day.id] = day }
-            sources["claude"] = "Claude Code 本机日志 · 刚刚扫描"
+            for day in aggregate(Array(messages.values), provider: "claude", timeZone: collectionZone) { merged[day.id] = day }
+            sources["claude"] = "claude-local-logs"
         }
 
         let antigravityRecords = scanAntigravity(catalog: catalog, support: support)
         if !antigravityRecords.isEmpty {
-            for day in aggregate(antigravityRecords, provider: "antigravity") { merged[day.id] = day }
-            sources["antigravity"] = "Antigravity 本机数据库 · 增量扫描"
+            for day in aggregate(antigravityRecords, provider: "antigravity", timeZone: collectionZone) { merged[day.id] = day }
+            sources["antigravity"] = "antigravity-local-database"
         }
 
         let result = HistoryResult(days: merged.values.sorted { $0.date == $1.date ? $0.provider < $1.provider : $0.date < $1.date },
-                                   sources: sources, updatedAt: Date(), warnings: warnings)
+                                   sources: sources, updatedAt: Date(), warnings: warnings,
+                                   timeZoneIdentifier: collectionZone.identifier)
         try? FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(result) { try? data.write(to: archive, options: .atomic) }
         return result
     }
 
-    static func aggregate(_ records: [UsageRecord], provider: String) -> [UsageDay] {
+    static func aggregate(_ records: [UsageRecord], provider: String, timeZone: TimeZone = zone) -> [UsageDay] {
+        let dayFormatter = dayFormatter(timeZone: timeZone)
         var groups: [String: UsageDay] = [:]
         for record in records {
             let date = dayFormatter.string(from: record.date)
@@ -655,8 +690,10 @@ enum HistoryAnalyzer {
         return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
     }
 
-    static func apiDate(_ label: String, reference: Date) -> Date? {
-        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.timeZone = zone
+    static func apiDate(_ label: String, reference: Date, timeZone: TimeZone = zone) -> Date? {
+        // Chinese month/day labels are part of the upstream data format.
+        let calendar = calendar(timeZone: timeZone)
+        let formatter = DateFormatter(); formatter.locale = Locale(identifier: "zh_CN"); formatter.timeZone = timeZone
         formatter.dateFormat = "yyyy年M月d日"
         let year = calendar.component(.year, from: reference)
         guard var date = formatter.date(from: "\(year)年" + label) else { return nil }

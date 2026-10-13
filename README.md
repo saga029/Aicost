@@ -12,7 +12,7 @@ A native macOS menu bar app for AI subscription quotas and local token usage.
 
 ## Download
 
-Download **Aicost-1.0.0-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This initial release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
+Download **Aicost-1.0.1-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
 
 ## Features
 
@@ -21,6 +21,7 @@ Download **Aicost-1.0.0-macos-arm64.zip** from [Releases](https://github.com/sag
 - Daily stacked usage, per-app shares and model breakdowns.
 - Today, this month, past 7/30 days and custom ranges up to 31 days.
 - English and Simplified Chinese, with responsive quota cards.
+- Daily grouping and reset times follow the device's current time zone, including daylight saving time. App error messages follow the selected interface language.
 - Local history, manual refresh and launch-at-login settings.
 
 ## Build and test
@@ -40,12 +41,13 @@ Aicost reads local usage metadata from Codex, Claude Code and Antigravity. The b
 
 Usage history is stored in `~/Library/Application Support/Aicost`. Aicost's history cache contains dates, models and numeric usage/cost data, not conversation content or credential values. Aicost does not include an analytics or telemetry backend. See [PRIVACY.md](PRIVACY.md) for the distinction between local processing and provider requests.
 
+Version 1.0.1 keeps separate daily archives for each device time zone and rebuilds them from available timestamped records. The old `history-v1.json` remains on the device; daily totals from that fixed-zone archive are not carried into a different grouping. Records whose original timestamps are no longer available cannot be regrouped. OpenUsage's date-only chart labels retain their reported calendar dates.
+
 ## Current limits
 
-- Daily buckets currently use the Asia/Shanghai time zone.
 - Token/cost estimates depend on available logs and pricing coverage. Displayed costs are API-equivalent estimates, not subscription invoices.
 - Moving or deleting source logs can change historical daily totals.
-- Some diagnostic text remains in Chinese; only English and Simplified Chinese are supported.
+- Only English and Simplified Chinese are supported.
 
 ## License
 
