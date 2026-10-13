@@ -1,0 +1,42 @@
+# Build products and downloaded dependencies
+build/
+dist/
+.cache/
+.build/
+*.dmg
+*.zip
+*.app/
+*.dSYM/
+# Local data and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+auth.json
+credentials.json
+history*.json
+*-cache*/
+*.jsonl
+*.log
+*.vscdb*
+# Local development records
+.DS_Store
+.backup/
+.planning/
+.impeccable/
+.agents/
+.codex/
+.claude/
+.cursor/
+AGENTS.md
+CLAUDE.md
+task_plan.md
+findings.md
+progress.md
+*REVIEW.md
+*.bak
+*.before-*
+__pycache__/
