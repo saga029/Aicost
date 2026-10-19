@@ -2,11 +2,13 @@
 
 ## What the app reads
 
-Aicost analyzes local session usage metadata and provider quota results. Parsing may read existing transcript files, but Aicost's usage cache does not retain their conversation content. Credential discovery and provider requests are handled by the bundled upstream Runway CLI on the user's Mac.
+Aicost analyzes local session usage metadata and provider quota results, including Grok's local session usage files. Parsing may read existing transcript files, but Aicost's usage cache does not retain their conversation content. Most credential discovery and provider requests are handled by the bundled upstream Runway CLI on the user's Mac.
+
+For Antigravity's Gemini quotas, Aicost can also invoke an already installed `agy` CLI with the `/usage` command. It runs outside the current project directory, with no user conversation text. This CLI is optional and is not bundled with Aicost. If Gemini quotas are unavailable, Aicost can read an unexpired token from the local Runway Antigravity authentication file and request quota metadata directly from Google's Cloud Code service. Aicost does not copy that token into its history cache, repository or release package.
 
 ## Network activity
 
-There is no Aicost server, telemetry collection or remote upload endpoint. Quota requests may authenticate directly to the user's AI provider. The upstream helper can download public model pricing. An optional integration reads the local OpenUsage HTTP service on the loopback interface.
+There is no Aicost server, telemetry collection or remote upload endpoint. Quota requests may authenticate directly to the user's AI provider, including Google's `daily-cloudcode-pa.googleapis.com` and `cloudcode-pa.googleapis.com` quota endpoints for the Antigravity fallback. The upstream helper can download public model pricing. An optional integration reads the local OpenUsage HTTP service on the loopback interface.
 
 ## Local storage
 

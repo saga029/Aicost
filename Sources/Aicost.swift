@@ -265,20 +265,33 @@ final class AppSettings: ObservableObject {
         return compact ? value : t("\(value) 重置", "Resets \(value)")
     }
 
-    func localizedMetricName(_ id: String) -> String {
+    func localizedMetricName(_ metric: Metric) -> String {
+        let id = metric.labelID ?? metric.id
+        let generic = ["session", "weekly", "daily", "monthly", "primary", "secondary"]
+        if generic.contains(id.lowercased()) {
+            switch metric.kind {
+            case .session: return t("5h内额度", "5h Session")
+            case .daily: return t("每日", "Daily")
+            case .weekly: return t("每周", "Weekly")
+            case .monthly: return t("每月", "Monthly")
+            case .other: break
+            }
+        }
         let zhNames = [
             "daily": "每日", "chat": "聊天额度", "completions": "代码补全", "premiumRequests": "高级请求",
             "totalUsage": "总额度", "autoUsage": "Cursor 模型", "apiUsage": "其他模型",
-            "session": "5h内额度", "weekly": "每周",
+            "session": "5h内额度", "weekly": "每周", "monthly": "每月",
             "geminiSession": "Gemini · 5h内额度", "geminiWeekly": "Gemini · 每周",
-            "nonGeminiSession": "Claude · 5h内额度", "nonGeminiWeekly": "Claude · 每周"
+            "nonGeminiSession": "其他模型 · 5h内额度", "nonGeminiWeekly": "其他模型 · 每周",
+            "spark": "Spark · 5h内额度", "sparkWeekly": "Spark · 每周"
         ]
         let enNames = [
             "daily": "Daily", "chat": "Chat Quota", "completions": "Completions", "premiumRequests": "Premium Requests",
             "totalUsage": "Total Quota", "autoUsage": "Cursor Models", "apiUsage": "Other Models",
-            "session": "5h Session", "weekly": "Weekly",
+            "session": "5h Session", "weekly": "Weekly", "monthly": "Monthly",
             "geminiSession": "Gemini · 5h Session", "geminiWeekly": "Gemini · Weekly",
-            "nonGeminiSession": "Claude · 5h Session", "nonGeminiWeekly": "Claude · Weekly"
+            "nonGeminiSession": "Other models · 5h Session", "nonGeminiWeekly": "Other models · Weekly",
+            "spark": "Spark · 5h Session", "sparkWeekly": "Spark · Weekly"
         ]
         return isEnglish ? (enNames[id] ?? id) : (zhNames[id] ?? id)
     }
@@ -505,8 +518,8 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
         let providers = usage.providers.filter { settings.shownProviders.contains($0.id) }
         if (settings.menuStyle == "icons" || settings.menuStyle == "icon_names"), !providers.isEmpty {
             let items = providers.map { provider -> (id: String, text: String) in
-                let metric = provider.primary(settings.quotaMode)
-                let pctText = metric?.remaining.map { "\(Int(($0 * 100).rounded()))%" } ?? "—"
+                let metric = provider.statusBarMetric()
+                let pctText = metric?.remaining.map { QuotaWindows.percentageText($0) } ?? "—"
                 if settings.menuStyle == "icon_names" {
                     let shortName = compact[provider.id, default: provider.name]
                     return (provider.id, shortName + " " + pctText)
@@ -522,19 +535,20 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
             button.image = appIcon
             button.imagePosition = settings.menuStyle == "icon" ? .imageOnly : .imageLeading
             let pieces = providers.compactMap { provider -> String? in
-                let metric = provider.primary(settings.quotaMode)
+                let metric = provider.statusBarMetric()
                 let name = settings.menuStyle == "names" ? provider.name : compact[provider.id, default: provider.name]
-                return name + " " + (metric?.remaining.map { "\(Int(($0 * 100).rounded()))%" } ?? "—")
+                return name + " " + (metric?.remaining.map { QuotaWindows.percentageText($0) } ?? "—")
             }
             button.title = settings.menuStyle == "icon" ? "" : (pieces.isEmpty ? " Aicost" : " " + pieces.joined(separator: "  "))
         }
         let defaultAccountLabel = self.settings.isEnglish ? "Local Account" : "本机账户"
         let quotaHelp = usage.providers.map { (provider: ProviderUsage) -> String in
             let planText = provider.plan ?? defaultAccountLabel
-            let metricsText = provider.visibleMetrics.map { metric in
-                let pct = Int(((metric.remaining ?? 0) * 100).rounded())
-                let detail = settings.t("剩余 \(pct)% · 已用 \(100 - pct)%", "Remaining \(pct)% · Used \(100 - pct)%")
-                return "  \(settings.localizedMetricName(metric.id)): \(detail)"
+            let metricsText = provider.statusBarMetrics.map { metric in
+                let remaining = QuotaWindows.percentageText(metric.remaining ?? 0)
+                let used = QuotaWindows.percentageText(1 - (metric.remaining ?? 0))
+                let detail = settings.t("剩余 \(remaining) · 已用 \(used)", "Remaining \(remaining) · Used \(used)")
+                return "  \(settings.localizedMetricName(metric)): \(detail)"
             }.joined(separator: "\n")
             return "\(provider.name) · \(planText)\n\(metricsText)"
         }.joined(separator: "\n\n")
@@ -699,12 +713,6 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
     }
 }
 
-struct Metric: Identifiable {
-    let id: String
-    let remaining: Double?
-    let reset: Date?
-    var isFiveHour: Bool = false
-}
 struct ProviderUsage: Identifiable {
     let id: String
     let name: String
@@ -712,19 +720,35 @@ struct ProviderUsage: Identifiable {
     let metrics: [Metric]
     let stale: Bool
     var fetchedAt: Date? = nil
+    /// Pro Antigravity spends the Gemini pool. Once those windows are known, the other-model
+    /// pool stays off the quota card and the menu bar.
+    private var quotaMetrics: [Metric] {
+        guard id == "antigravity" else { return metrics }
+        let gemini = metrics.filter { QuotaWindows.pool(of: $0.id) == "gemini" }
+        return gemini.isEmpty ? metrics : gemini
+    }
+    private var readings: [QuotaReading] {
+        quotaMetrics.map { QuotaReading(id: $0.id, remaining: $0.remaining, kind: $0.kind) }
+    }
     var visibleMetrics: [Metric] {
-        let fiveHour = metrics.filter { $0.isFiveHour && $0.remaining != nil }
-        return fiveHour.isEmpty ? metrics : fiveHour
+        QuotaWindows.orderedIndices(readings).map { quotaMetrics[$0] }
     }
     func primary(_ mode: String) -> Metric? {
-        let values = metrics.filter { $0.remaining != nil }
-        let fiveHour = values.filter(\.isFiveHour)
-        if !fiveHour.isEmpty {
-            return fiveHour.min { ($0.remaining ?? 1) < ($1.remaining ?? 1) } ?? fiveHour.first
-        }
-        if mode == "minimum" { return values.min { ($0.remaining ?? 1) < ($1.remaining ?? 1) } }
-        if mode == "weekly" { return values.filter { $0.id.lowercased().contains("weekly") }.min { ($0.remaining ?? 1) < ($1.remaining ?? 1) } ?? values.first }
-        return values.first
+        guard let index = QuotaWindows.primaryIndex(readings, mode: mode) else { return nil }
+        return quotaMetrics[index]
+    }
+    func statusBarMetric() -> Metric? {
+        guard let index = QuotaWindows.statusBarIndex(readings) else { return nil }
+        return quotaMetrics[index]
+    }
+    var statusBarMetrics: [Metric] {
+        let visible = visibleMetrics
+        guard let headline = statusBarMetric() else { return visible }
+        let pool = QuotaWindows.pool(of: headline.id)
+        let inPool = visible.filter { QuotaWindows.pool(of: $0.id) == pool }
+        let rows = inPool.isEmpty ? visible : inPool
+        guard QuotaWindows.hidesSessionOnStatusBar(readings) else { return rows }
+        return rows.filter { $0.kind != .session }
     }
 }
 struct ProviderStats: Identifiable {
@@ -882,6 +906,16 @@ final class UsageStore: ObservableObject {
                 parts.append(stamp(folder.appendingPathComponent(".system_generated/logs/transcript.jsonl")))
             }
         }
+        let grokSessions = home.appendingPathComponent(".grok/sessions")
+        if let workspaces = try? fm.contentsOfDirectory(at: grokSessions, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+            for workspace in workspaces {
+                guard let sessions = try? fm.contentsOfDirectory(at: workspace, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+                for session in sessions {
+                    let usage = session.appendingPathComponent("usage.json")
+                    if fm.fileExists(atPath: usage.path) { parts.append(stamp(usage)) }
+                }
+            }
+        }
         let agConv = home.appendingPathComponent(".gemini/antigravity/conversations")
         if let files = try? fm.contentsOfDirectory(at: agConv, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
             let recent = files.sorted {
@@ -907,16 +941,11 @@ final class UsageStore: ObservableObject {
         do {
             let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/runway")
             let data = try await Task.detached(priority: .userInitiated) { () throws -> Data in
-                let process = Process(); let pipe = Pipe()
-                process.executableURL = helper; process.arguments = force ? ["--force"] : []
-                process.standardOutput = pipe; process.standardError = FileHandle.nullDevice
-                try process.run()
-                DispatchQueue.global().asyncAfter(deadline: .now() + 45) { if process.isRunning { process.terminate() } }
-                let data = pipe.fileHandleForReading.readDataToEndOfFile(); process.waitUntilExit()
-                if process.terminationStatus != 0 && data.isEmpty {
-                    throw NSError(domain: "Aicost", code: Int(process.terminationStatus))
+                let result = try LocalCommand.run(executable: helper, arguments: force ? ["--force"] : [], timeout: 45)
+                if result.status != 0 && result.data.isEmpty {
+                    throw NSError(domain: "Aicost", code: Int(result.status))
                 }
-                return data
+                return result.data
             }.value
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let rows = root["providers"] as? [String: [String: Any]], !rows.isEmpty else {
@@ -929,21 +958,21 @@ final class UsageStore: ObservableObject {
                 var order: [String]
                 switch key {
                 case "cursor": order = ["totalUsage", "autoUsage", "apiUsage"]
-                case "codex": order = ["session", "weekly"]
+                case "codex": order = ["session", "weekly", "monthly", "spark", "sparkWeekly"]
                 case "grok": order = ["weekly"]
                 case "antigravity": order = ["geminiSession", "nonGeminiSession", "geminiWeekly", "nonGeminiWeekly"]
-                default: order = ["session", "daily", "weekly", "chat", "completions", "premiumRequests"]
+                default: order = ["session", "daily", "weekly", "monthly", "chat", "completions", "premiumRequests"]
                 }
                 order = order.filter { resources[$0] != nil } + resources.keys.filter { !order.contains($0) }.sorted()
-                let metrics = order.compactMap { id -> Metric? in
+                let metrics = distinctMetrics(order.compactMap { id -> Metric? in
                     guard let value = resources[id], let remaining = value["remaining"] as? Double else { return nil }
                     let limit = value["limit"] as? Double ?? 100
-                    let ratio = limit > 0 ? remaining / limit : 0
-                    let windowSeconds = (value["windowSeconds"] as? NSNumber)?.intValue
-                    let isFiveHour = windowSeconds == 18000 || id.lowercased().contains("session")
+                    let ratio = limit > 0 ? max(0, min(1, remaining / limit)) : 0
+                    let windowSeconds = QuotaWindows.seconds(from: value["windowSeconds"])
+                    let reading = QuotaWindows.reading(id: id, remaining: ratio, windowSeconds: windowSeconds)
                     let reset = (value["resetsAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                    return Metric(id: id, remaining: ratio, reset: reset, isFiveHour: isFiveHour)
-                }
+                    return Metric(id: reading.id, remaining: reading.remaining, reset: reset, kind: reading.kind)
+                })
                 let fetchedAt = (row["fetchedAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
                 return ProviderUsage(id: key, name: providerNames[key] ?? row["displayName"] as? String ?? key, plan: row["plan"] as? String, metrics: metrics, stale: row["stale"] as? Bool ?? false, fetchedAt: fetchedAt)
             }
@@ -965,6 +994,7 @@ final class UsageStore: ObservableObject {
             }
             mergeNewerOpenUsageQuotas(rows)
         } catch { apiConnected = false }
+        await supplementAntigravityGemini()
         let data = lastAPIData
         let collected = await Task.detached(priority: .utility) { HistoryAnalyzer.collect(apiData: data) }.value
         updateCalendarContext()
@@ -986,7 +1016,7 @@ final class UsageStore: ObservableObject {
     private func mergeNewerOpenUsageQuotas(_ rows: [[String: Any]]) {
         let labelMap: [String: [String: String]] = [
             "cursor": ["total usage": "totalUsage", "cursor models": "autoUsage", "other models": "apiUsage"],
-            "codex": ["session": "session", "weekly": "weekly"],
+            "codex": ["session": "session", "weekly": "weekly", "monthly": "monthly"],
             "grok": ["weekly limit": "weekly", "weekly": "weekly"],
             "antigravity": ["session": "geminiSession", "weekly": "geminiWeekly", "claude": "nonGeminiSession", "claude weekly": "nonGeminiWeekly"]
         ]
@@ -1000,7 +1030,7 @@ final class UsageStore: ObservableObject {
             let existing = updated[idx]
             guard existing.stale || existing.metrics.isEmpty || fetched > (existing.fetchedAt ?? .distantPast) else { continue }
             let lines = row["lines"] as? [[String: Any]] ?? []
-            let metrics = lines.compactMap { line -> Metric? in
+            let metrics = distinctMetrics(lines.compactMap { line -> Metric? in
                 guard line["type"] as? String == "progress",
                       let rawLabel = (line["label"] as? String)?.lowercased(),
                       let mapped = map[rawLabel],
@@ -1008,10 +1038,11 @@ final class UsageStore: ObservableObject {
                 let limit = line["limit"] as? Double ?? 100
                 let ratio = limit > 0 ? max(0, min(1, (limit - used) / limit)) : 0
                 let periodMs = (line["periodDurationMs"] as? NSNumber)?.intValue
-                let isFiveHour = periodMs == 18_000_000 || mapped.lowercased().contains("session")
+                let windowSeconds = periodMs.flatMap { $0 > 0 ? $0 / 1000 : nil }
+                let reading = QuotaWindows.reading(id: mapped, remaining: ratio, windowSeconds: windowSeconds)
                 let reset = (line["resetsAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                return Metric(id: mapped, remaining: ratio, reset: reset, isFiveHour: isFiveHour)
-            }
+                return Metric(id: reading.id, remaining: reading.remaining, reset: reset, kind: reading.kind)
+            })
             guard !metrics.isEmpty else { continue }
             updated[idx] = ProviderUsage(id: existing.id, name: existing.name, plan: (row["plan"] as? String) ?? existing.plan, metrics: metrics, stale: false, fetchedAt: fetched)
             changed = true
@@ -1021,6 +1052,70 @@ final class UsageStore: ObservableObject {
             lastUpdated = Date()
             onRefresh?()
         }
+    }
+
+    /// Replace Antigravity's headline with Gemini's 5-hour and weekly windows. The summary endpoint
+    /// can omit that pool and return only models a Pro account cannot spend.
+    private func supplementAntigravityGemini() async {
+        guard let index = providers.firstIndex(where: { $0.id == "antigravity" }) else { return }
+        let existing = providers[index]
+        let agy = await Task.detached(priority: .userInitiated) { Self.fetchAgyGeminiWindows() }.value
+        if !agy.isEmpty {
+            let metrics = AntigravityGeminiQuota.merging(agy, into: existing.metrics)
+            providers[index] = ProviderUsage(id: existing.id, name: existing.name, plan: existing.plan, metrics: metrics, stale: existing.stale, fetchedAt: existing.fetchedAt)
+            return
+        }
+        guard !existing.metrics.contains(where: { QuotaWindows.pool(of: $0.id) == "gemini" }),
+              let window = await Self.fetchAntigravityGeminiSession() else { return }
+        var metrics = existing.metrics.filter { QuotaWindows.pool(of: $0.id) != "other" }
+        metrics.insert(Metric(id: "geminiSession", remaining: window.remaining, reset: window.reset, kind: .session), at: 0)
+        providers[index] = ProviderUsage(id: existing.id, name: existing.name, plan: existing.plan, metrics: metrics, stale: existing.stale, fetchedAt: existing.fetchedAt)
+    }
+
+    nonisolated private static func fetchAgyGeminiWindows() -> [AntigravityGeminiQuota.PoolWindow] {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent(".local/bin/agy"),
+            URL(fileURLWithPath: "/opt/homebrew/bin/agy"),
+            URL(fileURLWithPath: "/usr/local/bin/agy")
+        ]
+        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else { return [] }
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "\(home.path)/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
+        guard let result = try? LocalCommand.run(executable: executable, arguments: ["-p", "/usage", "--output-format", "json"],
+                                                 environment: environment, timeout: 15), result.status == 0 else { return [] }
+        return AntigravityGeminiQuota.pools(fromAgy: result.data)
+    }
+
+    private static func fetchAntigravityGeminiSession() async -> AntigravityGeminiQuota.Window? {
+        let authURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Runway/antigravity/auth.json")
+        guard let data = try? Data(contentsOf: authURL),
+              let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let token = root["accessToken"] as? String, !token.isEmpty else { return nil }
+        if let expires = root["expiresAtMs"] as? Double, expires > 0, Date().timeIntervalSince1970 * 1000 > expires - 15_000 {
+            return nil
+        }
+        let bases = [
+            "https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota",
+            "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota"
+        ]
+        for base in bases {
+            guard let url = URL(string: base) else { continue }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.timeoutInterval = 12
+            request.httpBody = Data("{}".utf8)
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+            request.setValue("antigravity", forHTTPHeaderField: "User-Agent")
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            guard let (body, response) = try? await URLSession.shared.data(for: request),
+                  let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode),
+                  let window = AntigravityGeminiQuota.session(from: body) else { continue }
+            return window
+        }
+        return nil
     }
 }
 
@@ -1237,9 +1332,9 @@ struct QuickSummaryView: View {
     }
 
     private func providerRow(_ provider: ProviderUsage) -> some View {
-        let primary = provider.primary(settings.quotaMode)
+        let primary = provider.statusBarMetric()
         let ratio = max(0, min(1, primary?.remaining ?? 0))
-        let pct = primary?.remaining.map { Int(($0 * 100).rounded()) }
+        let pct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
         let isHovered = hoveredProvider == provider.id
         return Button {
             openProvider(provider.id)
@@ -1260,7 +1355,7 @@ struct QuickSummaryView: View {
                     }
                     Spacer()
                     if let pct {
-                        Text(settings.t("剩余 \(pct)%", "\(pct)% left"))
+                        Text(settings.t("剩余 \(QuotaWindows.percentageText(ratio))", "\(QuotaWindows.percentageText(ratio)) left"))
                             .font(.system(size: 14, weight: .bold, design: .rounded))
                             .foregroundStyle(pct == 0 ? Color.red : pct <= 20 ? Color.orange : Color.primary)
                             .monospacedDigit()
@@ -1278,10 +1373,14 @@ struct QuickSummaryView: View {
                     }
                 }.frame(height: 6)
                 HStack {
-                    Text(primary.map { settings.localizedMetricName($0.id) } ?? settings.t("未提供额度", "No quota"))
-                    if provider.visibleMetrics.count > 1 {
-                        Text(settings.t("· 共 \(provider.visibleMetrics.count) 项配额", "· \(provider.visibleMetrics.count) quotas"))
-                            .foregroundStyle(.tertiary)
+                    if provider.statusBarMetrics.count > 1 {
+                        Text(provider.statusBarMetrics.map { metric in
+                            return settings.localizedMetricName(metric) + " " + QuotaWindows.percentageText(metric.remaining ?? 0)
+                        }.joined(separator: " · "))
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Text(primary.map { settings.localizedMetricName($0) } ?? settings.t("未提供额度", "No quota"))
                     }
                     Spacer()
                     if let reset = primary?.reset {
@@ -1743,6 +1842,17 @@ struct CalendarPickerPopover: View {
     }
 }
 
+struct ModelBreakdown: Identifiable {
+    var id: String
+    var provider: String
+    var name: String
+    var total: Double
+    var cached: Double
+    var output: Double
+    var requests: Int
+    var pricedCost: Double
+}
+
 struct AnalysisSnapshot {
     var start: Date = Date()
     var end: Date = Date()
@@ -1764,7 +1874,7 @@ struct AnalysisSnapshot {
     var dayProvidersByDate: [String: [String]] = [:]
     var dayPartsByDate: [String: [StackedDayItem]] = [:]
     var maxDayTokens: Double = 1
-    var modelRows: [UsageModel] = []
+    var modelRows: [ModelBreakdown] = []
     var maxModelTokens: Double = 1
     var sharesByTokens: [AppShare] = []
     var sharesByCost: [AppShare] = []
@@ -1840,7 +1950,7 @@ struct AnalysisSnapshot {
         var totalRequests = 0
         var detailedInputTotal: Double = 0
         var detailedCachedTotal: Double = 0
-        var modelsMap: [String: UsageModel] = [:]
+        var modelsMap: [String: ModelBreakdown] = [:]
 
         for row in rows {
             totalTokens += row.total
@@ -1874,18 +1984,15 @@ struct AnalysisSnapshot {
                 daysMap[row.date] = day
             }
 
-            for item in row.models {
-                let name = provider == "all" ? (providerNames[row.provider] ?? row.provider) + " · " + item.name : item.name
-                var model = modelsMap[name] ?? UsageModel(name: name)
-                model.input += item.input
+            for item in row.models where item.total > 0 || item.pricedCost > 0 {
+                let id = row.provider + "\u{1f}" + item.name
+                var model = modelsMap[id] ?? ModelBreakdown(id: id, provider: row.provider, name: item.name, total: 0, cached: 0, output: 0, requests: 0, pricedCost: 0)
                 model.cached += item.cached
-                model.written += item.written
                 model.output += item.output
                 model.total += item.total
                 model.requests += item.requests
-                model.knownCost = (model.knownCost ?? 0) + item.pricedCost
-                if let value = item.cost, let old = model.cost { model.cost = old + value } else { model.cost = nil }
-                modelsMap[name] = model
+                model.pricedCost += item.pricedCost
+                modelsMap[id] = model
             }
         }
 
@@ -2820,14 +2927,9 @@ struct UsageDetailSection: View {
                             .frame(width: 90, alignment: .leading)
 
                         HStack(spacing: 5) {
-                            ForEach(dayProviders.prefix(5), id: \.self) { pid in
+                            ForEach(dayProviders, id: \.self) { pid in
                                 ProviderBadge(id: pid, size: 13)
-                            }
-                            if dayProviders.count == 1, let first = dayProviders.first {
-                                Text(providerNames[first] ?? first)
-                                    .font(.system(size: 11))
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
+                                    .help(providerNames[pid] ?? pid)
                             }
                         }
                         .frame(width: 130, alignment: .leading)
@@ -2900,10 +3002,14 @@ struct UsageDetailSection: View {
                 ForEach(snapshot.modelRows) { model in
                     let ratio = min(1, max(0.04, model.total / maxModelTokens))
                     HStack(spacing: 12) {
-                        Text(model.name)
-                            .font(.system(size: 12, weight: .medium))
-                            .lineLimit(1)
-                            .frame(maxWidth: .infinity, alignment: .leading)
+                        HStack(spacing: 6) {
+                            ProviderBadge(id: model.provider, size: 13)
+                                .help(providerNames[model.provider] ?? model.provider)
+                            Text(model.name)
+                                .font(.system(size: 12, weight: .medium))
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
                         HStack(spacing: 8) {
                             Text(shortTokens(model.total))
@@ -3164,7 +3270,7 @@ struct QuotaView: View {
 
     private func overviewTile(_ provider: ProviderUsage) -> some View {
         let primary = provider.primary(settings.quotaMode)
-        let pct = primary?.remaining.map { Int(($0 * 100).rounded()) }
+        let pct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
         let ratio = max(0, min(1, primary?.remaining ?? 0))
         return VStack(alignment: .leading, spacing: 8) {
             HStack(spacing: 6) {
@@ -3177,12 +3283,12 @@ struct QuotaView: View {
                     Text(plan).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
                 }
             }
-            Text(pct.map { "\($0)%" } ?? "—")
+            Text(primary?.remaining.map { QuotaWindows.percentageText($0) } ?? "—")
                 .font(.system(size: 26, weight: .bold, design: .rounded))
                 .foregroundStyle(statusColor(pct))
                 .monospacedDigit()
                 .lineLimit(1)
-            Text(primary.map { settings.localizedMetricName($0.id) } ?? settings.t("无额度", "No Quota"))
+            Text(primary.map { settings.localizedMetricName($0) } ?? settings.t("无额度", "No Quota"))
                 .font(.system(size: 10, weight: .medium))
                 .foregroundStyle(.secondary)
                 .lineLimit(2)
@@ -3206,7 +3312,7 @@ struct QuotaView: View {
 
     private func providerCard(_ provider: ProviderUsage) -> some View {
         let primary = provider.primary(settings.quotaMode)
-        let primaryPct = primary?.remaining.map { Int(($0 * 100).rounded()) }
+        let primaryPct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 8) {
                 ProviderBadge(id: provider.id, size: 18)
@@ -3250,16 +3356,16 @@ struct QuotaView: View {
 
     private func metricRow(_ metric: Metric, color: Color) -> some View {
         let ratio = max(0, min(1, metric.remaining ?? 0))
-        let remPct = Int((ratio * 100).rounded())
-        let usedPct = max(0, 100 - remPct)
+        let remPct = QuotaWindows.displayedPercent(ratio)
+        let usedPct = QuotaWindows.percentageText(1 - ratio)
         return VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(settings.localizedMetricName(metric.id))
+                Text(settings.localizedMetricName(metric))
                     .font(.system(size: 13, weight: .medium))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
                 Spacer(minLength: 6)
-                Text(settings.t("剩余 \(remPct)%", "\(remPct)% left"))
+                Text(settings.t("剩余 \(QuotaWindows.percentageText(ratio))", "\(QuotaWindows.percentageText(ratio)) left"))
                     .font(.system(size: 13, weight: .semibold, design: .rounded))
                     .foregroundStyle(statusColor(remPct))
                     .monospacedDigit()
@@ -3283,7 +3389,7 @@ struct QuotaView: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 Spacer(minLength: 0)
-                Text(settings.t("已用 \(usedPct)%", "\(usedPct)% used"))
+                Text(settings.t("已用 \(usedPct)", "\(usedPct) used"))
                     .font(.system(size: 10))
                     .monospacedDigit()
                     .lineLimit(1)
@@ -3349,6 +3455,7 @@ struct SettingsView: View {
                 Picker(settings.t("显示哪个周期", "Quota Priority"), selection: $settings.quotaMode) {
                     Text(settings.t("5h内额度优先", "5h Quota First")).tag("current")
                     Text(settings.t("每周额度优先", "Weekly Quota First")).tag("weekly")
+                    Text(settings.t("每月额度优先", "Monthly Quota First")).tag("monthly")
                     Text(settings.t("显示最紧的额度", "Tightest Quota First")).tag("minimum")
                 }
                 ForEach(quotaOrder, id: \.self) { id in
@@ -3364,7 +3471,7 @@ struct SettingsView: View {
                 Button(settings.t("恢复菜单栏位置", "Reset Menu Bar Position")) {
                     NotificationCenter.default.post(name: .restoreAicostMenu, object: nil)
                 }
-                Text(settings.t("菜单栏支持直接显示 Cursor、Grok、Codex、Antigravity 等订阅图标与剩余额度。有 5h 限制的订阅固定显示 5h 内额度。", "The menu bar displays subscription icons and remaining quotas for Cursor, Grok, Codex, Antigravity, etc. 5h-limited subscriptions prioritize the 5-hour window."))
+                Text(settings.t("状态栏在周额度、月额度未用完时显示 5 小时剩余；没有 5 小时窗口时显示月额度。周额度或月额度用完后，状态栏显示 0%，不再显示 5 小时额度。上方周期选项用于额度页面。", "While the weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. Once either allowance is used up, the menu bar shows 0% and hides the 5-hour balance. The priority picker above applies to the quota page."))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Section(settings.t("其他订阅 / 应用（可选）", "Other Subscriptions / Apps (Optional)")) {

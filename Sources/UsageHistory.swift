@@ -1,6 +1,74 @@
 import Foundation
 import CryptoKit
 import SQLite3
+import Darwin
+
+/// Bounded local reads: a child ignoring SIGTERM, closing stdout early, or
+/// leaving stdout open in a descendant must not hold a refresh indefinitely.
+enum LocalCommand {
+    enum Failure: Error { case timedOut, outputTooLarge, readFailed }
+    struct Result {
+        let data: Data
+        let status: Int32
+    }
+
+    static func run(executable: URL, arguments: [String], environment: [String: String]? = nil,
+                    timeout: TimeInterval, maxOutputBytes: Int = 8_388_608) throws -> Result {
+        let process = Process()
+        let pipe = Pipe()
+        let exited = DispatchSemaphore(value: 0)
+        process.executableURL = executable
+        process.arguments = arguments
+        process.environment = environment
+        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        process.terminationHandler = { _ in exited.signal() }
+        try process.run()
+        try? pipe.fileHandleForWriting.close()
+        defer {
+            if process.isRunning {
+                process.terminate()
+                if exited.wait(timeout: .now() + 0.2) == .timedOut, process.isRunning {
+                    kill(process.processIdentifier, SIGKILL)
+                    _ = exited.wait(timeout: .now() + 1)
+                }
+            }
+            try? pipe.fileHandleForReading.close()
+        }
+        let descriptor = pipe.fileHandleForReading.fileDescriptor
+        let flags = fcntl(descriptor, F_GETFL)
+        guard flags >= 0, fcntl(descriptor, F_SETFL, flags | O_NONBLOCK) >= 0 else { throw Failure.readFailed }
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 65_536)
+        while true {
+            let remaining = deadline - ProcessInfo.processInfo.systemUptime
+            guard remaining > 0 else { throw Failure.timedOut }
+            var descriptorState = pollfd(fd: descriptor, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
+            let ready = poll(&descriptorState, 1, Int32(min(100, remaining * 1000)))
+            if ready < 0 {
+                if errno == EINTR { continue }
+                throw Failure.readFailed
+            }
+            guard ready > 0 else { continue }
+            let count = Darwin.read(descriptor, &buffer, buffer.count)
+            if count > 0 {
+                guard count <= maxOutputBytes - data.count else { throw Failure.outputTooLarge }
+                data.append(contentsOf: buffer.prefix(count))
+            } else if count == 0 {
+                break
+            } else if errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK {
+                throw Failure.readFailed
+            }
+        }
+        // EOF is not proof of process exit: a child can close stdout then hang.
+        let remaining = max(0, deadline - ProcessInfo.processInfo.systemUptime)
+        guard exited.wait(timeout: .now() + remaining) == .success else { throw Failure.timedOut }
+        return Result(data: data, status: process.terminationStatus)
+    }
+}
 
 struct UsageModel: Codable, Identifiable {
     var id: String { name }
@@ -332,6 +400,13 @@ enum HistoryAnalyzer {
             warnings.removeAll { $0 == "logs-pending:codex" }
         }
 
+        let grokRecords = scanGrok(catalog: catalog, support: support)
+        if !grokRecords.isEmpty {
+            for day in aggregate(grokRecords, provider: "grok", timeZone: collectionZone) { merged[day.id] = day }
+            sources["grok"] = "grok-local-usage"
+            warnings.removeAll { $0 == "logs-pending:grok" }
+        }
+
         let claude = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
         var messages: [String: UsageRecord] = [:]
         let enumerator = FileManager.default.enumerator(at: claude, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
@@ -401,7 +476,7 @@ enum HistoryAnalyzer {
 
     static func scanAntigravity(catalog: PriceCatalog, support: URL) -> [UsageRecord] {
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity/conversations")
-        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v1")
+        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v3")
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         let fm = FileManager.default
         guard let urls = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
@@ -484,6 +559,7 @@ enum HistoryAnalyzer {
         let u3 = pbVarint(3, in: usageMsg) ?? 0
         let u5 = pbVarint(5, in: usageMsg) ?? 0
         guard u1 >= 0, u2 >= 0, u3 >= 0, u5 >= 0 else { return nil }
+        guard u1 <= Int64.max - u2 else { return nil }
         let input = Double(u1 + u2)
         let output = Double(u3)
         let cached = Double(u5)
@@ -499,7 +575,7 @@ enum HistoryAnalyzer {
         } else if let stepData, let step1 = pbBytes(1, in: stepData), let secs = pbVarint(1, in: step1), secs > 0 {
             tsSeconds = secs
         }
-        guard let secs = tsSeconds else { return nil }
+        guard let secs = tsSeconds, secs <= 253_402_300_799 else { return nil }
         let date = Date(timeIntervalSince1970: TimeInterval(secs))
 
         let cleanedId: String? = modelId.flatMap { raw in
@@ -538,6 +614,8 @@ enum HistoryAnalyzer {
         while idx < data.count {
             let byte = data[idx]
             idx += 1
+            // A UInt64 varint has at most one payload bit in its tenth byte.
+            guard shift < 63 || byte <= 1 else { return nil }
             result |= UInt64(byte & 0x7F) << shift
             if (byte & 0x80) == 0 { return result }
             shift += 7
@@ -561,8 +639,7 @@ enum HistoryAnalyzer {
                 if idx > data.count { return nil }
             case 2:
                 guard let len = pbReadVarint(data, &idx) else { return nil }
-                let length = Int(len)
-                guard length >= 0, idx + length <= data.count else { return nil }
+                guard let length = Int(exactly: len), length <= data.count - idx else { return nil }
                 idx += length
             case 5:
                 idx += 4
@@ -588,8 +665,7 @@ enum HistoryAnalyzer {
                 if idx > data.count { return nil }
             case 2:
                 guard let len = pbReadVarint(data, &idx) else { return nil }
-                let length = Int(len)
-                guard length >= 0, idx + length <= data.count else { return nil }
+                guard let length = Int(exactly: len), length <= data.count - idx else { return nil }
                 if field == targetField { return Data(data[idx..<(idx + length)]) }
                 idx += length
             case 5:
@@ -607,6 +683,78 @@ enum HistoryAnalyzer {
               let str = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !str.isEmpty else { return nil }
         return str
+    }
+
+    /// Turn totals in `~/.grok/sessions/*/usage.json`. Cached tokens are already inside `inputTokens`,
+    /// matching the OpenUsage split of fresh input plus cache read.
+    static func parseGrokUsage(_ data: Data, catalog: PriceCatalog) -> [UsageRecord]? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        func number(_ object: [String: Any], _ key: String) -> Double {
+            if let value = object[key] as? Double { return value }
+            if let value = object[key] as? Int { return Double(value) }
+            if let value = object[key] as? NSNumber { return value.doubleValue }
+            return 0
+        }
+        func record(model: String, stats: [String: Any], date: Date) -> UsageRecord? {
+            let rawInput = number(stats, "inputTokens")
+            let cached = number(stats, "cachedReadTokens")
+            let written = number(stats, "cacheCreationTokens")
+            let output = number(stats, "outputTokens")
+            guard [rawInput, cached, written, output].allSatisfy({ $0.isFinite && $0 >= 0 }) else { return nil }
+            let input = max(0, rawInput - cached)
+            let total = input + cached + written + output
+            guard total.isFinite, total > 0 else { return nil }
+            let name = model.isEmpty ? "unknown" : model
+            let cost = catalog.estimate(model: name, input: input, cached: cached, written: written, output: output)
+            return UsageRecord(date: date, model: name, input: input, cached: cached, written: written, output: output, total: total, cost: cost)
+        }
+        var records: [UsageRecord] = []
+        for turn in root["turns"] as? [[String: Any]] ?? [] {
+            guard let date = (turn["endedAt"] as? String).flatMap(parseDate) else { continue }
+            let usage = turn["modelUsage"] as? [String: Any] ?? [:]
+            if usage.isEmpty {
+                let model = turn["primaryModelId"] as? String ?? "unknown"
+                if let row = record(model: model, stats: turn, date: date) { records.append(row) }
+            } else {
+                for (model, value) in usage {
+                    let stats = value as? [String: Any] ?? [:]
+                    if let row = record(model: model, stats: stats, date: date) { records.append(row) }
+                }
+            }
+        }
+        return records
+    }
+
+    static func scanGrok(catalog: PriceCatalog, support: URL) -> [UsageRecord] {
+        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".grok/sessions")
+        let cache = storageFolder(support: support).appendingPathComponent("grok-usage-cache")
+        try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
+        let fm = FileManager.default
+        guard let workspaces = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
+        var records: [UsageRecord] = []
+        for workspace in workspaces {
+            guard let sessions = try? fm.contentsOfDirectory(at: workspace, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+            for session in sessions {
+                let url = session.appendingPathComponent("usage.json")
+                guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+                      let size = (attrs[.size] as? NSNumber)?.uint64Value,
+                      let modified = attrs[.modificationDate] as? Date else { continue }
+                let name = SHA256.hash(data: Data(url.path.utf8)).map { String(format: "%02x", $0) }.joined()
+                let file = cache.appendingPathComponent(name + ".json")
+                if let cached = try? Data(contentsOf: file),
+                   let prior = try? JSONDecoder().decode(CodexFileCache.self, from: cached),
+                   prior.size == size, prior.modified == modified {
+                    records.append(contentsOf: prior.records)
+                    continue
+                }
+                guard let data = try? Data(contentsOf: url), let parsed = parseGrokUsage(data, catalog: catalog) else { continue }
+                if let encoded = try? JSONEncoder().encode(CodexFileCache(size: size, modified: modified, records: parsed)) {
+                    try? encoded.write(to: file, options: .atomic)
+                }
+                records.append(contentsOf: parsed)
+            }
+        }
+        return records
     }
 
     static func scanCodex(catalog: PriceCatalog, support: URL) -> [UsageRecord] {
@@ -700,4 +848,295 @@ enum HistoryAnalyzer {
         if date > calendar.startOfDay(for: reference) { date = calendar.date(byAdding: .year, value: -1, to: date) ?? date }
         return date
     }
+}
+
+/// Gemini is the Antigravity subscription that Pro accounts can spend. `agy /usage` reports its
+/// 5-hour and weekly windows; the Cloud Code summary often returns only the other-model pool.
+enum AntigravityGeminiQuota {
+    struct Window {
+        var remaining: Double
+        var reset: Date?
+    }
+
+    struct PoolWindow {
+        var id: String
+        var remaining: Double
+        var reset: Date?
+        var kind: QuotaWindowKind { id == "geminiWeekly" ? .weekly : .session }
+    }
+
+    static func merging(_ windows: [PoolWindow], into existing: [Metric]) -> [Metric] {
+        let incoming = windows.map { Metric(id: $0.id, remaining: $0.remaining, reset: $0.reset, kind: $0.kind) }
+        let updated = Set(incoming.map(\.id))
+        return distinctMetrics(incoming + existing.filter { !updated.contains($0.labelID ?? $0.id) })
+    }
+
+    static func pools(fromAgy data: Data) -> [PoolWindow] {
+        let payloads = agyPayloads(data)
+        var windows: [PoolWindow] = []
+        for payload in payloads {
+            guard let groups = payload["groups"] as? [[String: Any]] else { continue }
+            for group in groups {
+                for bucket in group["buckets"] as? [[String: Any]] ?? [] {
+                    if bucket["disabled"] as? Bool == true { continue }
+                    let bucketID = (bucket["id"] as? String)?.lowercased() ?? ""
+                    guard bucketID.contains("gemini") else { continue }
+                    guard let fraction = finiteFraction(bucket["remaining_fraction"] ?? bucket["remainingFraction"]) else { continue }
+                    let window = (bucket["window"] as? String)?.lowercased() ?? ""
+                    let weekly = bucketID.contains("week") || window == "weekly"
+                    let reset = (bucket["reset_time"] as? String ?? bucket["resetTime"] as? String).flatMap(HistoryAnalyzer.parseDate)
+                    let id = weekly ? "geminiWeekly" : "geminiSession"
+                    guard !windows.contains(where: { $0.id == id }) else { continue }
+                    windows.append(PoolWindow(id: id, remaining: min(1, max(0, fraction)), reset: reset))
+                }
+            }
+            if !windows.isEmpty { break }
+        }
+        return windows.sorted { $0.kind.rawValue < $1.kind.rawValue }
+    }
+
+    private static func agyPayloads(_ data: Data) -> [[String: Any]] {
+        var payloads: [[String: Any]] = []
+        func collect(_ root: [String: Any]) {
+            if let status = root["status"] as? String,
+               ["error", "failed", "failure"].contains(status.lowercased()) { return }
+            if let command = root["command"] as? [String: Any], let payload = command["data"] as? [String: Any] {
+                payloads.append(payload)
+            } else if root["groups"] != nil {
+                payloads.append(root)
+            }
+        }
+        if let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            collect(root)
+        }
+        if payloads.isEmpty, let text = String(data: data, encoding: .utf8) {
+            for line in text.split(whereSeparator: \.isNewline) {
+                guard let lineData = line.data(using: .utf8),
+                      let root = try? JSONSerialization.jsonObject(with: lineData) as? [String: Any] else { continue }
+                collect(root)
+            }
+        }
+        return payloads
+    }
+
+    private static func finiteFraction(_ value: Any?) -> Double? {
+        let number: Double?
+        if let value = value as? Double {
+            number = value
+        } else if let value = value as? Int {
+            number = Double(value)
+        } else if let value = value as? NSNumber {
+            number = value.doubleValue
+        } else {
+            number = nil
+        }
+        guard let number, number.isFinite else { return nil }
+        return number
+    }
+
+    static func session(from data: Data) -> Window? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let buckets = root["buckets"] as? [[String: Any]] else { return nil }
+        var worst: Double?
+        var reset: Date?
+        for bucket in buckets {
+            guard let model = (bucket["modelId"] as? String)?.lowercased(), model.contains("gemini") else { continue }
+            guard let fraction = finiteFraction(bucket["remainingFraction"]) else { continue }
+            let clamped = min(1, max(0, fraction))
+            if worst == nil || clamped < worst! {
+                worst = clamped
+                reset = (bucket["resetTime"] as? String).flatMap(HistoryAnalyzer.parseDate)
+            }
+        }
+        guard let worst else { return nil }
+        return Window(remaining: worst, reset: reset)
+    }
+}
+
+enum QuotaWindowKind: Int, Comparable {
+    case session = 0
+    case daily = 1
+    case weekly = 2
+    case monthly = 3
+    case other = 4
+
+    static func < (lhs: QuotaWindowKind, rhs: QuotaWindowKind) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+}
+
+struct QuotaReading: Equatable {
+    var id: String
+    var remaining: Double?
+    var kind: QuotaWindowKind
+    var isFiveHour: Bool { kind == .session }
+}
+
+enum QuotaWindows {
+    static let fiveHourSeconds = 18_000
+    static let daySeconds = 86_400
+    static let weekSeconds = 604_800
+    static let monthSeconds = 2_592_000
+
+    static func seconds(from value: Any?) -> Int? {
+        guard let number = value as? NSNumber else { return nil }
+        let seconds = number.doubleValue
+        guard seconds > 0, seconds < Double(Int.max) else { return nil }
+        return Int(seconds.rounded())
+    }
+
+    static func kind(id: String, windowSeconds: Int?) -> QuotaWindowKind {
+        if let windowSeconds, windowSeconds > 0 {
+            if abs(windowSeconds - fiveHourSeconds) <= 15 * 60 { return .session }
+            if abs(windowSeconds - daySeconds) <= 2 * 60 * 60 { return .daily }
+            if abs(windowSeconds - weekSeconds) <= 12 * 60 * 60 { return .weekly }
+            if abs(windowSeconds - monthSeconds) <= 2 * daySeconds { return .monthly }
+        }
+        let key = id.lowercased()
+        if key.contains("month") { return .monthly }
+        if key.contains("week") { return .weekly }
+        if key.contains("daily") || key == "day" { return .daily }
+        if key.contains("session") || key.contains("5h") || key == "spark" { return .session }
+        return .other
+    }
+
+    static func canonicalID(id: String, kind: QuotaWindowKind) -> String {
+        let generic = ["session", "weekly", "daily", "monthly", "primary", "secondary"]
+        guard generic.contains(id.lowercased()) else { return id }
+        switch kind {
+        case .session: return "session"
+        case .daily: return "daily"
+        case .weekly: return "weekly"
+        case .monthly: return "monthly"
+        case .other: return id
+        }
+    }
+
+    static func reading(id: String, remaining: Double?, windowSeconds: Int?) -> QuotaReading {
+        let resolved = kind(id: id, windowSeconds: windowSeconds)
+        return QuotaReading(id: canonicalID(id: id, kind: resolved), remaining: remaining, kind: resolved)
+    }
+
+    static func isExhausted(_ remaining: Double) -> Bool {
+        remaining.isFinite && remaining <= 0
+    }
+
+    static func displayedPercent(_ remaining: Double) -> Int {
+        guard remaining.isFinite else { return 0 }
+        let clamped = max(0, min(1, remaining))
+        // Keep a positive sub-percent allowance distinct from exhausted quota.
+        return clamped > 0 ? max(1, Int((clamped * 100).rounded())) : 0
+    }
+
+    static func percentageText(_ remaining: Double) -> String {
+        guard remaining.isFinite else { return "—" }
+        return remaining > 0 && remaining < 0.01 ? "<1%" : "\(displayedPercent(remaining))%"
+    }
+
+    /// Antigravity reports two independent pools. Gemini is the main pool and the one the menu bar follows.
+    static func pool(of id: String) -> String {
+        let key = id.lowercased()
+        if key.contains("nongemini") { return "other" }
+        if key.contains("gemini") { return "gemini" }
+        if key.hasPrefix("spark") { return "spark" }
+        return "main"
+    }
+
+    static func preferredPoolIndices(_ readings: [QuotaReading]) -> [Int] {
+        let available = readings.indices.filter { readings[$0].remaining != nil }
+        let gemini = available.filter { pool(of: readings[$0].id) == "gemini" }
+        if !gemini.isEmpty { return Array(gemini) }
+        let main = available.filter { pool(of: readings[$0].id) == "main" }
+        if !main.isEmpty { return Array(main) }
+        return Array(available)
+    }
+
+    static func orderedIndices(_ readings: [QuotaReading]) -> [Int] {
+        readings.enumerated().filter { $0.element.remaining != nil }.sorted { lhs, rhs in
+            if lhs.element.kind != rhs.element.kind { return lhs.element.kind < rhs.element.kind }
+            return lhs.offset < rhs.offset
+        }.map(\.offset)
+    }
+
+    /// The headline window. A used-up weekly or monthly window blocks the account even when the
+    /// 5-hour window still has a balance, so that longer window wins over the selected priority.
+    static func primaryIndex(_ readings: [QuotaReading], mode: String) -> Int? {
+        let available = preferredPoolIndices(readings)
+        guard !available.isEmpty else { return nil }
+        let blocked = available.filter { isExhausted(readings[$0].remaining ?? 1) }
+        if let blocker = blocked.max(by: { lhs, rhs in
+            if readings[lhs].kind != readings[rhs].kind { return readings[lhs].kind < readings[rhs].kind }
+            return (readings[lhs].remaining ?? 1) > (readings[rhs].remaining ?? 1)
+        }) {
+            return blocker
+        }
+        func tightest(_ indices: [Int]) -> Int? {
+            indices.min { (readings[$0].remaining ?? 1) < (readings[$1].remaining ?? 1) }
+        }
+        switch mode {
+        case "weekly":
+            return tightest(available.filter { readings[$0].kind == .weekly }) ?? available.first
+        case "monthly":
+            return tightest(available.filter { readings[$0].kind == .monthly }) ?? available.first
+        case "minimum":
+            return tightest(Array(available))
+        default:
+            return tightest(available.filter { readings[$0].kind == .session }) ?? available.first
+        }
+    }
+
+    /// Menu-bar figure. While weekly and monthly allowances remain, show the 5-hour window, or the
+    /// monthly window when the account has no 5-hour window. Once either longer allowance is used up,
+    /// show that allowance and leave the 5-hour balance off the menu bar.
+    static func statusBarIndex(_ readings: [QuotaReading]) -> Int? {
+        let available = preferredPoolIndices(readings)
+        guard !available.isEmpty else { return nil }
+        func tightest(_ indices: [Int]) -> Int? {
+            indices.min { (readings[$0].remaining ?? 1) < (readings[$1].remaining ?? 1) }
+        }
+        let allowance = available.filter { readings[$0].kind == .weekly || readings[$0].kind == .monthly }
+        let blocked = allowance.filter { isExhausted(readings[$0].remaining ?? 1) }
+        if let blocker = blocked.max(by: { lhs, rhs in
+            if readings[lhs].kind != readings[rhs].kind { return readings[lhs].kind < readings[rhs].kind }
+            return (readings[lhs].remaining ?? 1) > (readings[rhs].remaining ?? 1)
+        }) {
+            return blocker
+        }
+        if let session = tightest(available.filter { readings[$0].kind == .session }) {
+            return session
+        }
+        if let month = tightest(available.filter { readings[$0].kind == .monthly }) {
+            return month
+        }
+        return available.first
+    }
+
+    static func hidesSessionOnStatusBar(_ readings: [QuotaReading]) -> Bool {
+        preferredPoolIndices(readings).contains {
+            let reading = readings[$0]
+            return (reading.kind == .weekly || reading.kind == .monthly) && reading.remaining.map(isExhausted) == true
+        }
+    }
+}
+
+func distinctMetrics(_ metrics: [Metric]) -> [Metric] {
+    var seen = Set<String>()
+    return metrics.map { metric in
+        var id = metric.id
+        var suffix = 2
+        while !seen.insert(id).inserted {
+            id = "\(metric.id)#\(suffix)"
+            suffix += 1
+        }
+        guard id != metric.id else { return metric }
+        return Metric(id: id, remaining: metric.remaining, reset: metric.reset, kind: metric.kind, labelID: metric.labelID ?? metric.id)
+    }
+}
+
+struct Metric: Identifiable {
+    let id: String
+    let remaining: Double?
+    let reset: Date?
+    var kind: QuotaWindowKind = .other
+    var labelID: String? = nil
 }

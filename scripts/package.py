@@ -3,6 +3,7 @@
 import argparse
 import hashlib
 import pathlib
+import plistlib
 import subprocess
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -14,6 +15,9 @@ version = (ROOT / "VERSION").read_text().strip()
 app = arguments.app.resolve()
 if not app.is_dir() or app.name != "Aicost.app":
     raise SystemExit("Expected a built Aicost.app")
+info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+if info.get("CFBundleShortVersionString") != version or info.get("CFBundleIdentifier") != "io.github.saga029.aicost":
+    raise SystemExit("Application metadata does not match this release. Rebuild before packaging.")
 subprocess.run(["codesign", "--verify", "--strict", str(app)], check=True)
 arguments.output.mkdir(parents=True, exist_ok=True)
 archive = arguments.output / ("Aicost-" + version + "-macos-arm64.zip")

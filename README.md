@@ -18,12 +18,12 @@ All interface previews use synthetic demo data. They contain no real account or 
 
 ## Download
 
-Download **Aicost-1.0.1-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
+Download **Aicost-1.0.2-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
 
 ## Features
 
-- Menu bar quota icons, names and remaining percentages.
-- Five-hour windows take priority where available.
+- Menu bar quota icons, names and remaining percentages. While weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. A used-up weekly or monthly allowance shows 0% and hides the 5-hour balance.
+- Quota cards keep the 5-hour, weekly and monthly windows together.
 - Daily stacked usage, per-app shares and model breakdowns.
 - Today, this month, past 7/30 days and custom ranges up to 31 days.
 - English and Simplified Chinese, with responsive quota cards.
@@ -59,7 +59,7 @@ The build downloads the public Runway **v0.8.17** release, verifies its pinned S
 
 ## Data and privacy
 
-Aicost reads local usage metadata from Codex, Claude Code and Antigravity. The bundled Runway CLI can reuse local credentials to request quotas from the corresponding provider. These requests go to the provider, not to an Aicost backend. The optional OpenUsage service is read at `127.0.0.1:6736`.
+Aicost reads local usage metadata from Codex, Claude Code, Grok and Antigravity. The bundled Runway CLI can reuse local credentials to request quotas from the corresponding provider. An optional installed `agy` CLI or direct Google quota query supplements Antigravity Gemini quotas. These requests go to the provider, not to an Aicost backend. The optional OpenUsage service is read at `127.0.0.1:6736`.
 
 Usage history is stored in `~/Library/Application Support/Aicost`. Aicost's history cache contains dates, models and numeric usage/cost data, not conversation content or credential values. Aicost does not include an analytics or telemetry backend. See [PRIVACY.md](PRIVACY.md) for the distinction between local processing and provider requests.
 

@@ -12,11 +12,12 @@
 
 ## 下载与安装
 
-需要 **Apple Silicon / macOS 15+**。从 [Releases](https://github.com/saga029/Aicost/releases) 下载 `Aicost-1.0.1-macos-arm64.zip`，解压后将 `Aicost.app` 放入应用程序目录。本次版本采用临时签名，尚未通过 Apple 公证，首次启动可能需要通过 Finder 或系统“隐私与安全性”批准打开。
+需要 **Apple Silicon / macOS 15+**。从 [Releases](https://github.com/saga029/Aicost/releases) 下载 `Aicost-1.0.2-macos-arm64.zip`，解压后将 `Aicost.app` 放入应用程序目录。本次版本采用临时签名，尚未通过 Apple 公证，首次启动可能需要通过 Finder 或系统“隐私与安全性”批准打开。
 
 ## 功能
 
-- 菜单栏订阅图标、名称与剩余额度；有 5 小时窗口时优先展示。
+- 菜单栏订阅图标、名称与剩余额度。周额度、月额度未用完时显示 5 小时剩余；没有 5 小时窗口时显示月额度。周额度或月额度用完后显示 0%，不再显示 5 小时额度。
+- 额度页同时保留 5 小时、每周和每月窗口。
 - 每日堆叠用量、各应用占比、模型明细及 API 等价费用估算。
 - 今天、本月、近 7/30 天与最长 31 天的自定义区间。
 - 中英文界面、自适应额度卡片、本机历史、手动刷新与登录后启动。
@@ -53,7 +54,7 @@ python3 scripts/package.py
 
 ## 隐私与数据来源
 
-读取本机 Codex、Claude Code 和 Antigravity 用量元数据；配额采集器可使用本机已有凭据向相应服务商请求额度。没有 Aicost 云端或遥测后台。可选读取 `127.0.0.1:6736` 的 OpenUsage 接口。
+读取本机 Codex、Claude Code、Grok 和 Antigravity 用量元数据；配额采集器可使用本机已有凭据向相应服务商请求额度。可选使用本机已安装的 `agy` CLI 或直接查询 Google 补充 Antigravity Gemini 额度。没有 Aicost 云端或遥测后台。可选读取 `127.0.0.1:6736` 的 OpenUsage 接口。
 
 Aicost 的历史缓存位于 `~/Library/Application Support/Aicost`，保存日期、模型与用量/费用数值，不保存会话正文或凭据值。发布源码和安装包不包含使用者的账户、用量历史或本机配置。详情见 [PRIVACY.md](PRIVACY.md)。
 
