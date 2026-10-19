@@ -2,6 +2,7 @@
 """Run pure history checks without accessing accounts, APIs or real logs."""
 import os
 import pathlib
+import platform
 import subprocess
 import tempfile
 
@@ -11,3 +12,7 @@ with tempfile.TemporaryDirectory(prefix="aicost-test-") as temporary:
     subprocess.run(["xcrun", "swiftc", "-parse-as-library", str(ROOT / "Sources/UsageHistory.swift"), str(ROOT / "Tests/HistoryChecks.swift"), "-o", str(executable)], check=True)
     for zone in ["UTC", "America/Los_Angeles", "Asia/Tokyo", "Pacific/Auckland"]:
         subprocess.run([str(executable)], check=True, env={**os.environ, "TZ": zone})
+
+    refresh_executable = pathlib.Path(temporary) / "refresh-checks"
+    subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-D", "AICOST_TESTING", "-target", f"{platform.machine()}-apple-macosx15.0", str(ROOT / "Sources/Aicost.swift"), str(ROOT / "Sources/UsageHistory.swift"), str(ROOT / "Tests/RefreshChecks.swift"), "-o", str(refresh_executable)], check=True)
+    subprocess.run([str(refresh_executable)], check=True)

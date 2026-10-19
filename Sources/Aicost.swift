@@ -4,7 +4,9 @@ import Charts
 import Combine
 import ServiceManagement
 
+#if !AICOST_TESTING
 @main
+#endif
 @MainActor
 struct AicostApplication {
     static func main() {
@@ -224,7 +226,6 @@ final class AppSettings: ObservableObject {
 
     @Published var language: String // "zh-Hans", "en", "system"
     @Published var menuStyle: String
-    @Published var quotaMode: String
     @Published var shownProviders: Set<String>
     @Published var refreshInterval: Double
     @Published var defaultRange: Int
@@ -281,7 +282,7 @@ final class AppSettings: ObservableObject {
             "daily": "每日", "chat": "聊天额度", "completions": "代码补全", "premiumRequests": "高级请求",
             "totalUsage": "总额度", "autoUsage": "Cursor 模型", "apiUsage": "其他模型",
             "session": "5h内额度", "weekly": "每周", "monthly": "每月",
-            "geminiSession": "Gemini · 5h内额度", "geminiWeekly": "Gemini · 每周",
+            "geminiSession": "5h内额度", "geminiWeekly": "每周",
             "nonGeminiSession": "其他模型 · 5h内额度", "nonGeminiWeekly": "其他模型 · 每周",
             "spark": "Spark · 5h内额度", "sparkWeekly": "Spark · 每周"
         ]
@@ -289,7 +290,7 @@ final class AppSettings: ObservableObject {
             "daily": "Daily", "chat": "Chat Quota", "completions": "Completions", "premiumRequests": "Premium Requests",
             "totalUsage": "Total Quota", "autoUsage": "Cursor Models", "apiUsage": "Other Models",
             "session": "5h Session", "weekly": "Weekly", "monthly": "Monthly",
-            "geminiSession": "Gemini · 5h Session", "geminiWeekly": "Gemini · Weekly",
+            "geminiSession": "5h Session", "geminiWeekly": "Weekly",
             "nonGeminiSession": "Other models · 5h Session", "nonGeminiWeekly": "Other models · Weekly",
             "spark": "Spark · 5h Session", "sparkWeekly": "Spark · Weekly"
         ]
@@ -311,7 +312,6 @@ final class AppSettings: ObservableObject {
             defaults.set(2, forKey: "custom.menuStyleVersion")
         }
         menuStyle = defaults.string(forKey: "custom.menuStyle") ?? "icons"
-        quotaMode = defaults.string(forKey: "custom.quotaMode") ?? "current"
         shownProviders = Set(defaults.stringArray(forKey: "custom.shownProviders") ?? quotaOrder)
         if defaults.integer(forKey: "custom.refreshIntervalVersion") < 2 {
             let current = defaults.object(forKey: "custom.refreshInterval") as? Double ?? 300
@@ -329,7 +329,6 @@ final class AppSettings: ObservableObject {
     func save() {
         defaults.set(language, forKey: "custom.language")
         defaults.set(menuStyle, forKey: "custom.menuStyle")
-        defaults.set(quotaMode, forKey: "custom.quotaMode")
         defaults.set(Array(shownProviders), forKey: "custom.shownProviders")
         defaults.set(refreshInterval, forKey: "custom.refreshInterval")
         defaults.set(defaultRange, forKey: "custom.defaultRange")
@@ -452,10 +451,7 @@ final class AicostStatusDelegate: NSObject, NSApplicationDelegate, NSWindowDeleg
                 self?.openDashboard(nil)
             }
         }
-        Task {
-            await usage.refresh(force: false)
-            await usage.refresh(force: true)
-        }
+        Task { await usage.refresh(force: true) }
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self, let frame = self.statusItem.button?.window?.frame else { return }
             if !NSScreen.screens.contains(where: { $0.frame.intersects(frame) }) { self.restoreMenuPosition(nil) }
@@ -720,20 +716,21 @@ struct ProviderUsage: Identifiable {
     let metrics: [Metric]
     let stale: Bool
     var fetchedAt: Date? = nil
-    /// Pro Antigravity spends the Gemini pool. Once those windows are known, the other-model
-    /// pool stays off the quota card and the menu bar.
-    private var quotaMetrics: [Metric] {
-        guard id == "antigravity" else { return metrics }
-        let gemini = metrics.filter { QuotaWindows.pool(of: $0.id) == "gemini" }
-        return gemini.isEmpty ? metrics : gemini
-    }
+    /// Antigravity's quota card and menu bar stay on Gemini. Other-model windows are kept for refresh, not shown.
+    private var quotaMetrics: [Metric] { metrics }
     private var readings: [QuotaReading] {
         quotaMetrics.map { QuotaReading(id: $0.id, remaining: $0.remaining, kind: $0.kind) }
     }
+    /// Readings for the clicked status-bar caption. Antigravity uses these for `Gemini·5h内额度 · 每周`.
+    var menuReadings: [QuotaReading] { readings }
     var visibleMetrics: [Metric] {
         QuotaWindows.orderedIndices(readings).map { quotaMetrics[$0] }
     }
-    func primary(_ mode: String) -> Metric? {
+    var cardMetrics: [Metric] {
+        let allowed = QuotaWindows.cardReadings(readings, provider: id).map(\.id)
+        return allowed.compactMap { metricID in quotaMetrics.first { $0.id == metricID } }
+    }
+    func primary(_ mode: String = "current") -> Metric? {
         guard let index = QuotaWindows.primaryIndex(readings, mode: mode) else { return nil }
         return quotaMetrics[index]
     }
@@ -742,11 +739,10 @@ struct ProviderUsage: Identifiable {
         return quotaMetrics[index]
     }
     var statusBarMetrics: [Metric] {
-        let visible = visibleMetrics
-        guard let headline = statusBarMetric() else { return visible }
-        let pool = QuotaWindows.pool(of: headline.id)
-        let inPool = visible.filter { QuotaWindows.pool(of: $0.id) == pool }
-        let rows = inPool.isEmpty ? visible : inPool
+        let preferred = QuotaWindows.preferredPoolIndices(readings)
+        let subset = preferred.map { readings[$0] }
+        let rows = QuotaWindows.orderedIndices(subset).map { quotaMetrics[preferred[$0]] }
+        if id == "antigravity" { return rows }
         guard QuotaWindows.hidesSessionOnStatusBar(readings) else { return rows }
         return rows.filter { $0.kind != .session }
     }
@@ -757,6 +753,40 @@ struct ProviderStats: Identifiable {
     let today: String?
     let yesterday: String?
     let monthly: String?
+}
+
+/// Keep collection independent from UI state so refresh scheduling can be
+/// checked with fixture readers, without accounts, APIs or personal logs.
+struct UsageReaders {
+    var quotas: (Bool) async throws -> Data
+    var openUsage: () async throws -> Data
+    var history: (Data?) async -> HistoryResult
+    var activity: () async -> String = { "" }
+    var antigravity: () async -> AntigravitySupplement = { await UsageStore.fetchAgyGeminiSnapshot() }
+    var antigravityPlan: () async -> String? = { await UsageStore.fetchAntigravityPlan() }
+
+    static var live: UsageReaders {
+        UsageReaders(quotas: { force in
+            let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/runway")
+            return try await Task.detached(priority: .userInitiated) {
+                let result = try LocalCommand.run(executable: helper, arguments: force ? ["--force"] : [], timeout: 45)
+                if result.status != 0 && result.data.isEmpty {
+                    throw NSError(domain: "Aicost", code: Int(result.status))
+                }
+                return result.data
+            }.value
+        }, openUsage: {
+            var request = URLRequest(url: URL(string: "http://127.0.0.1:6736/v1/usage")!)
+            request.timeoutInterval = 2
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard (response as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
+            return data
+        }, history: { data in
+            await Task.detached(priority: .userInitiated) { HistoryAnalyzer.collect(apiData: data) }.value
+        }, activity: {
+            await Task.detached(priority: .utility) { UsageStore.activitySignature() }.value
+        })
+    }
 }
 
 @MainActor
@@ -773,18 +803,25 @@ final class UsageStore: ObservableObject {
     var onRefresh: (() -> Void)?
     private var lastAPIData: Data?
     private var pendingForceRefresh = false
-    private var lastForceRefreshAt = Date.distantPast
+    private var pendingLocalRefresh = false
+    private var isForceRefreshing = false
+    private var isCheckingActivity = false
+    private var lastLocalRefreshAt = Date.distantPast
+    private var localRefreshTask: Task<Void, Never>?
     private var lastActivitySignature = ""
     private var snapshotCache: [String: AnalysisSnapshot] = [:]
+    private let readers: UsageReaders
 
-    init() {
+    init(restoreHistory: Bool = true, readers: UsageReaders = .live) {
+        self.readers = readers
+        guard restoreHistory else { return }
         let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
         let archive = HistoryAnalyzer.archiveURL(support: support)
         if let data = try? Data(contentsOf: archive),
            let prior = try? JSONDecoder().decode(HistoryResult.self, from: data) {
             self.history = prior
             rebuildAvailableProviders()
-            prewarmSnapshots()
+            invalidateSnapshots()
         }
     }
 
@@ -817,23 +854,10 @@ final class UsageStore: ObservableObject {
         return built
     }
 
-    private func prewarmSnapshots() {
+    private func invalidateSnapshots() {
+        // Build only the visible range on demand; warming every provider and
+        // preset blocks the main actor for views that may never be opened.
         snapshotCache.removeAll(keepingCapacity: true)
-        let cal = HistoryAnalyzer.calendar
-        let today = cal.startOfDay(for: Date())
-        let monthStart = cal.dateInterval(of: .month, for: today)?.start ?? today
-        let presets: [(Int, Date)] = [
-            (0, monthStart),
-            (1, today),
-            (7, cal.date(byAdding: .day, value: -6, to: today) ?? today),
-            (30, cal.date(byAdding: .day, value: -29, to: today) ?? today)
-        ]
-        let providersToWarm = ["all"] + availableProviders
-        for (preset, start) in presets {
-            for pid in providersToWarm {
-                _ = snapshot(fromDate: start, throughDate: today, provider: pid, rangePreset: preset)
-            }
-        }
     }
 
     func checkRealtimeActivity() async {
@@ -841,16 +865,21 @@ final class UsageStore: ObservableObject {
             await refresh(force: true)
             return
         }
+        guard !isRefreshing, !isCheckingActivity else { return }
+        isCheckingActivity = true
+        defer { isCheckingActivity = false }
+        let signature = await readers.activity()
         guard !isRefreshing else { return }
-        let signature = await Task.detached(priority: .utility) { Self.activitySignature() }.value
         if lastActivitySignature.isEmpty {
             lastActivitySignature = signature
             return
         }
         guard signature != lastActivitySignature else { return }
-        guard Date().timeIntervalSince(lastForceRefreshAt) >= 12 else { return }
+        guard Date().timeIntervalSince(lastLocalRefreshAt) >= 5 else { return }
         lastActivitySignature = signature
-        await refresh(force: true)
+        // New local messages need a rescan, not another round of requests to
+        // every quota service. The timer and manual refresh update quotas.
+        await refreshLocalUsage()
     }
 
     @discardableResult private func updateCalendarContext() -> Bool {
@@ -862,29 +891,27 @@ final class UsageStore: ObservableObject {
             history = HistoryResult(days: [], sources: [:], updatedAt: .distantPast, warnings: [], timeZoneIdentifier: zone)
         }
         calendarContext = context
-        prewarmSnapshots()
+        invalidateSnapshots()
         onRefresh?()
         return true
     }
 
-    nonisolated private static func activitySignature() -> String {
+    nonisolated static func activitySignature() -> String {
         let fm = FileManager.default
         let home = fm.homeDirectoryForCurrentUser
         var parts: [String] = []
         func stamp(_ url: URL) -> String {
             guard let attrs = try? fm.attributesOfItem(atPath: url.path) else { return "" }
             let size = (attrs[.size] as? NSNumber)?.uint64Value ?? 0
-            let mod = Int(((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).rounded())
-            return "\(url.lastPathComponent):\(size):\(mod)"
+            let mod = ((attrs[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0).bitPattern
+            return "\(url.path):\(size):\(mod)"
         }
         let directFiles = [
-            home.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb-wal"),
-            home.appendingPathComponent("Library/Preferences/com.mattstallone.runway.plist")
+            home.appendingPathComponent("Library/Application Support/Cursor/User/globalStorage/state.vscdb-wal")
         ]
         for file in directFiles { parts.append(stamp(file)) }
         for cacheDir in [
-            home.appendingPathComponent("Library/Application Support/OpenUsage/log-scan-cache"),
-            home.appendingPathComponent("Library/Application Support/Runway/log-scan-cache")
+            home.appendingPathComponent("Library/Application Support/OpenUsage/log-scan-cache")
         ] {
             for folder in (try? fm.contentsOfDirectory(at: cacheDir, includingPropertiesForKeys: nil)) ?? [] {
                 parts.append(stamp(folder.appendingPathComponent("manifest.plist")))
@@ -894,6 +921,11 @@ final class UsageStore: ObservableObject {
         let codexToday = home.appendingPathComponent(".codex/sessions/" + todayPath)
         for file in (try? fm.contentsOfDirectory(at: codexToday, includingPropertiesForKeys: nil)) ?? [] where file.pathExtension == "jsonl" {
             parts.append(stamp(file))
+        }
+        let claude = home.appendingPathComponent(".claude/projects")
+        let claudeFiles = fm.enumerator(at: claude, includingPropertiesForKeys: [.contentModificationDateKey, .fileSizeKey], options: [.skipsHiddenFiles])
+        while let file = claudeFiles?.nextObject() as? URL {
+            if file.pathExtension == "jsonl" { parts.append(stamp(file)) }
         }
         let brain = home.appendingPathComponent(".gemini/antigravity/brain")
         if let folders = try? fm.contentsOfDirectory(at: brain, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
@@ -916,42 +948,61 @@ final class UsageStore: ObservableObject {
                 }
             }
         }
-        let agConv = home.appendingPathComponent(".gemini/antigravity/conversations")
-        if let files = try? fm.contentsOfDirectory(at: agConv, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) {
+        for root in HistoryAnalyzer.antigravityConversationRoots(home: home) {
+            guard let files = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey], options: [.skipsHiddenFiles]) else { continue }
             let recent = files.sorted {
                 let d0 = (try? $0.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 let d1 = (try? $1.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
                 return d0 > d1
-            }.prefix(6)
+            }.prefix(4)
             for file in recent {
                 parts.append(stamp(file))
             }
         }
-        return parts.joined(separator: "|")
+        return parts.sorted().joined(separator: "|")
     }
 
     func refresh(force: Bool) async {
         if isRefreshing {
-            if force { pendingForceRefresh = true }
+            // A forced scan already includes requests arriving while it runs.
+            if force && !isForceRefreshing { pendingForceRefresh = true }
             return
         }
         updateCalendarContext()
-        isRefreshing = true; error = nil
-        if force { lastForceRefreshAt = Date() }
+        isRefreshing = true
+        isForceRefreshing = force
+        error = nil
+        // Local totals and optional OpenUsage data can finish and publish while
+        // the quota helper is still waiting on a remote provider.
+        let hadAntigravity = providers.contains { $0.id == "antigravity" }
+        async let localRefresh: Void = refreshLocalUsage()
+        async let supplementalRefresh: Void = hadAntigravity ? supplementAntigravityGemini() : ()
+        await refreshQuotas(force: force)
+        if !hadAntigravity { await supplementAntigravityGemini() }
+        await supplementalRefresh
+        await localRefresh
+        isRefreshing = false
+        isForceRefreshing = false
+        onRefresh?()
+        if pendingForceRefresh {
+            pendingForceRefresh = false
+            await refresh(force: true)
+        }
+    }
+
+    private func refreshQuotas(force: Bool) async {
         do {
-            let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Helpers/runway")
-            let data = try await Task.detached(priority: .userInitiated) { () throws -> Data in
-                let result = try LocalCommand.run(executable: helper, arguments: force ? ["--force"] : [], timeout: 45)
-                if result.status != 0 && result.data.isEmpty {
-                    throw NSError(domain: "Aicost", code: Int(result.status))
-                }
-                return result.data
-            }.value
+            let data = try await readers.quotas(force)
             guard let root = try JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let rows = root["providers"] as? [String: [String: Any]], !rows.isEmpty else {
                 throw NSError(domain: "Aicost", code: 1)
             }
             let providerOrder = supportedOrder.filter { rows[$0] != nil } + rows.keys.filter { !supportedOrder.contains($0) }.sorted()
+            let retained = Dictionary(uniqueKeysWithValues: providers.map { ($0.id, $0.metrics) })
+            let retainedPlans = Dictionary(uniqueKeysWithValues: providers.compactMap { provider -> (String, String)? in
+                guard let plan = provider.plan, !plan.isEmpty else { return nil }
+                return (provider.id, plan)
+            })
             providers = providerOrder.compactMap { key in
                 guard let row = rows[key] else { return nil }
                 let resources = row["resources"] as? [String: [String: Any]] ?? [:]
@@ -964,7 +1015,7 @@ final class UsageStore: ObservableObject {
                 default: order = ["session", "daily", "weekly", "monthly", "chat", "completions", "premiumRequests"]
                 }
                 order = order.filter { resources[$0] != nil } + resources.keys.filter { !order.contains($0) }.sorted()
-                let metrics = distinctMetrics(order.compactMap { id -> Metric? in
+                let parsed = distinctMetrics(order.compactMap { id -> Metric? in
                     guard let value = resources[id], let remaining = value["remaining"] as? Double else { return nil }
                     let limit = value["limit"] as? Double ?? 100
                     let ratio = limit > 0 ? max(0, min(1, remaining / limit)) : 0
@@ -973,18 +1024,45 @@ final class UsageStore: ObservableObject {
                     let reset = (value["resetsAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
                     return Metric(id: reading.id, remaining: reading.remaining, reset: reset, kind: reading.kind)
                 })
+                let metrics = key == "antigravity"
+                    ? AntigravityGeminiQuota.mergingProvider(incoming: parsed, retained: retained[key] ?? [])
+                    : parsed
                 let fetchedAt = (row["fetchedAt"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                return ProviderUsage(id: key, name: providerNames[key] ?? row["displayName"] as? String ?? key, plan: row["plan"] as? String, metrics: metrics, stale: row["stale"] as? Bool ?? false, fetchedAt: fetchedAt)
+                let plan = Self.keptPlan(row["plan"] as? String, existing: retainedPlans[key])
+                return ProviderUsage(id: key, name: providerNames[key] ?? row["displayName"] as? String ?? key, plan: plan, metrics: metrics, stale: row["stale"] as? Bool ?? false, fetchedAt: fetchedAt)
             }
             rebuildAvailableProviders()
             lastUpdated = (root["generatedAt"] as? String).flatMap(HistoryAnalyzer.parseDate) ?? Date()
             onRefresh?()
         } catch { self.error = .quotaReadFailed }
+        // OpenUsage may have completed before the helper; apply its newer
+        // windows again after the helper replaces the provider list.
+        if let data = lastAPIData,
+           let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] {
+            mergeNewerOpenUsageQuotas(rows)
+        }
+    }
+
+    private func refreshLocalUsage() async {
+        if let localRefreshTask {
+            await localRefreshTask.value
+            return
+        }
+        let task = Task { await performLocalRefresh() }
+        localRefreshTask = task
+        await task.value
+        localRefreshTask = nil
+        if pendingLocalRefresh {
+            pendingLocalRefresh = false
+            await refreshLocalUsage()
+        }
+    }
+
+    private func performLocalRefresh() async {
+        lastLocalRefreshAt = Date()
         do {
-            var request = URLRequest(url: URL(string: "http://127.0.0.1:6736/v1/usage")!); request.timeoutInterval = 4
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200,
-                  let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw URLError(.badServerResponse) }
+            let data = try await readers.openUsage()
+            guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { throw URLError(.badServerResponse) }
             lastAPIData = data; apiConnected = true
             stats = rows.compactMap { row in
                 guard let id = row["providerId"] as? String else { return nil }
@@ -994,23 +1072,17 @@ final class UsageStore: ObservableObject {
             }
             mergeNewerOpenUsageQuotas(rows)
         } catch { apiConnected = false }
-        await supplementAntigravityGemini()
         let data = lastAPIData
-        let collected = await Task.detached(priority: .utility) { HistoryAnalyzer.collect(apiData: data) }.value
+        let collected = await readers.history(data)
         updateCalendarContext()
         if collected.timeZoneIdentifier == HistoryAnalyzer.zone.identifier {
+            invalidateSnapshots()
             history = collected
         } else {
-            pendingForceRefresh = true
+            pendingLocalRefresh = true
         }
         rebuildAvailableProviders()
-        prewarmSnapshots()
-        isRefreshing = false
         onRefresh?()
-        if pendingForceRefresh {
-            pendingForceRefresh = false
-            await refresh(force: true)
-        }
     }
 
     private func mergeNewerOpenUsageQuotas(_ rows: [[String: Any]]) {
@@ -1044,7 +1116,10 @@ final class UsageStore: ObservableObject {
                 return Metric(id: reading.id, remaining: reading.remaining, reset: reset, kind: reading.kind)
             })
             guard !metrics.isEmpty else { continue }
-            updated[idx] = ProviderUsage(id: existing.id, name: existing.name, plan: (row["plan"] as? String) ?? existing.plan, metrics: metrics, stale: false, fetchedAt: fetched)
+            let merged = id == "antigravity"
+                ? AntigravityGeminiQuota.mergingProvider(incoming: metrics, retained: existing.metrics)
+                : metrics
+            updated[idx] = ProviderUsage(id: existing.id, name: existing.name, plan: (row["plan"] as? String) ?? existing.plan, metrics: merged, stale: false, fetchedAt: fetched)
             changed = true
         }
         if changed {
@@ -1054,37 +1129,71 @@ final class UsageStore: ObservableObject {
         }
     }
 
-    /// Replace Antigravity's headline with Gemini's 5-hour and weekly windows. The summary endpoint
-    /// can omit that pool and return only models a Pro account cannot spend.
+    /// `agy` is the authority for both Antigravity pools. A summary that only echoes the
+    /// other-model pool must not replace Gemini on the menu bar. The corner label is the
+    /// subscription type, read from the client or CLI status when the quota feed leaves it blank.
     private func supplementAntigravityGemini() async {
-        guard let index = providers.firstIndex(where: { $0.id == "antigravity" }) else { return }
-        let existing = providers[index]
-        let agy = await Task.detached(priority: .userInitiated) { Self.fetchAgyGeminiWindows() }.value
-        if !agy.isEmpty {
-            let metrics = AntigravityGeminiQuota.merging(agy, into: existing.metrics)
-            providers[index] = ProviderUsage(id: existing.id, name: existing.name, plan: existing.plan, metrics: metrics, stale: existing.stale, fetchedAt: existing.fetchedAt)
-            return
+        guard let provider = providers.first(where: { $0.id == "antigravity" }) else { return }
+        let needsPlan = Self.planNeedsSubscriptionType(provider.plan)
+        async let fetchedPlan: String? = needsPlan ? readers.antigravityPlan() : nil
+        let snapshot = await readers.antigravity()
+        var windows = snapshot.windows
+        if windows.isEmpty,
+           let latest = providers.first(where: { $0.id == "antigravity" }),
+           !latest.metrics.contains(where: { QuotaWindows.pool(of: $0.id) == "gemini" }),
+           let window = await Self.fetchAntigravityGeminiSession() {
+            windows.append(AntigravityGeminiQuota.PoolWindow(id: "geminiSession", remaining: window.remaining, reset: window.reset))
         }
-        guard !existing.metrics.contains(where: { QuotaWindows.pool(of: $0.id) == "gemini" }),
-              let window = await Self.fetchAntigravityGeminiSession() else { return }
-        var metrics = existing.metrics.filter { QuotaWindows.pool(of: $0.id) != "other" }
-        metrics.insert(Metric(id: "geminiSession", remaining: window.remaining, reset: window.reset, kind: .session), at: 0)
-        providers[index] = ProviderUsage(id: existing.id, name: existing.name, plan: existing.plan, metrics: metrics, stale: existing.stale, fetchedAt: existing.fetchedAt)
+        let fallbackPlan = await fetchedPlan
+        let plan = snapshot.plan ?? fallbackPlan
+        // Local OpenUsage results can update this provider while the requests
+        // above are suspended. Merge into the latest row rather than a copy.
+        guard let index = providers.firstIndex(where: { $0.id == "antigravity" }) else { return }
+        let current = providers[index]
+        providers[index] = ProviderUsage(id: current.id, name: current.name,
+                                        plan: plan ?? current.plan,
+                                        metrics: AntigravityGeminiQuota.merging(windows, into: current.metrics),
+                                        stale: current.stale, fetchedAt: current.fetchedAt)
     }
 
-    nonisolated private static func fetchAgyGeminiWindows() -> [AntigravityGeminiQuota.PoolWindow] {
+    private static func planNeedsSubscriptionType(_ plan: String?) -> Bool {
+        guard let plan = plan?.trimmingCharacters(in: .whitespacesAndNewlines), !plan.isEmpty else { return true }
+        let folded = plan.lowercased()
+        return folded == "gemini" || folded == "antigravity"
+    }
+
+    /// Runway may leave Antigravity's plan empty. Keep the subscription type already read locally
+    /// so a later quota refresh does not strip the Pro tag while the next lookup is still running.
+    private static func keptPlan(_ incoming: String?, existing: String?) -> String? {
+        if !planNeedsSubscriptionType(incoming) { return incoming }
+        if !planNeedsSubscriptionType(existing) { return existing }
+        return nil
+    }
+
+    nonisolated static func fetchAgyGeminiSnapshot() async -> AntigravitySupplement {
         let home = FileManager.default.homeDirectoryForCurrentUser
         let candidates = [
             home.appendingPathComponent(".local/bin/agy"),
             URL(fileURLWithPath: "/opt/homebrew/bin/agy"),
             URL(fileURLWithPath: "/usr/local/bin/agy")
         ]
-        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else { return [] }
+        guard let executable = candidates.first(where: { FileManager.default.isExecutableFile(atPath: $0.path) }) else { return AntigravitySupplement() }
         var environment = ProcessInfo.processInfo.environment
         environment["PATH"] = "\(home.path)/.local/bin:/opt/homebrew/bin:/usr/local/bin:" + (environment["PATH"] ?? "/usr/bin:/bin")
-        guard let result = try? LocalCommand.run(executable: executable, arguments: ["-p", "/usage", "--output-format", "json"],
-                                                 environment: environment, timeout: 15), result.status == 0 else { return [] }
-        return AntigravityGeminiQuota.pools(fromAgy: result.data)
+        let csrf = UUID().uuidString + UUID().uuidString
+        let commandEnvironment = environment
+        let command = Task.detached(priority: .userInitiated) {
+            try? LocalCommand.run(executable: executable,
+                arguments: ["--csrf_token", csrf, "-p", "/usage", "--output-format", "json"],
+                environment: commandEnvironment, timeout: 15)
+        }
+        async let plan: String? = Task.detached(priority: .utility) {
+            AntigravityLocalPlan.read(expectedCSRF: csrf, waitForLaunch: true)
+        }.value
+        let result = await command.value
+        let resolvedPlan = await plan
+        guard let result, result.status == 0 else { return AntigravitySupplement(plan: resolvedPlan) }
+        return AntigravitySupplement(windows: AntigravityGeminiQuota.pools(fromAgy: result.data), plan: resolvedPlan)
     }
 
     private static func fetchAntigravityGeminiSession() async -> AntigravityGeminiQuota.Window? {
@@ -1117,6 +1226,11 @@ final class UsageStore: ObservableObject {
         }
         return nil
     }
+
+    nonisolated static func fetchAntigravityPlan() async -> String? {
+        await Task.detached(priority: .utility) { AntigravityLocalPlan.read() }.value
+    }
+
 }
 
 struct QuickSummaryView: View {
@@ -1336,6 +1450,9 @@ struct QuickSummaryView: View {
         let ratio = max(0, min(1, primary?.remaining ?? 0))
         let pct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
         let isHovered = hoveredProvider == provider.id
+        let detail = provider.id == "antigravity"
+            ? QuotaWindows.antigravityMenuLabel(provider.menuReadings, english: settings.isEnglish)
+            : nil
         return Button {
             openProvider(provider.id)
         } label: {
@@ -1373,7 +1490,11 @@ struct QuickSummaryView: View {
                     }
                 }.frame(height: 6)
                 HStack {
-                    if provider.statusBarMetrics.count > 1 {
+                    if let detail {
+                        Text(detail)
+                            .lineLimit(2)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else if provider.statusBarMetrics.count > 1 {
                         Text(provider.statusBarMetrics.map { metric in
                             return settings.localizedMetricName(metric) + " " + QuotaWindows.percentageText(metric.remaining ?? 0)
                         }.joined(separator: " · "))
@@ -2873,10 +2994,7 @@ struct UsageDetailSection: View {
                         .frame(maxWidth: .infinity)
                         .frame(height: 150)
                 } else {
-                    ScrollView(.horizontal) {
-                        dailyListView.frame(minWidth: 760)
-                    }
-                    .scrollIndicators(.visible)
+                    dailyListView.frame(maxWidth: .infinity, alignment: .leading)
                 }
             } else {
                 if snapshot.modelRows.isEmpty {
@@ -2901,14 +3019,14 @@ struct UsageDetailSection: View {
     private var dailyListView: some View {
         let maxDayTokens = snapshot.maxDayTokens
         return VStack(spacing: 0) {
-            HStack(spacing: 12) {
-                Text(settings.t("日期", "Date")).frame(width: 90, alignment: .leading)
-                Text(settings.t("活跃订阅", "Active Subscriptions")).frame(width: 130, alignment: .leading)
+            HStack(spacing: 8) {
+                Text(settings.t("日期", "Date")).frame(width: 70, alignment: .leading)
+                Text(settings.t("活跃订阅", "Active Subscriptions")).frame(width: 104, alignment: .leading)
                 Text(settings.t("总 Token", "Total Tokens")).frame(maxWidth: .infinity, alignment: .leading)
-                Text(settings.t("输入", "Input")).frame(width: 78, alignment: .trailing)
-                Text(settings.t("缓存读取", "Cache Read")).frame(width: 84, alignment: .trailing)
-                Text(settings.t("输出", "Output")).frame(width: 74, alignment: .trailing)
-                Text(settings.t("估算费用", "Est. Cost")).frame(width: 82, alignment: .trailing)
+                Text(settings.t("输入", "Input")).frame(width: 64, alignment: .trailing)
+                Text(settings.t("缓存读取", "Cache Read")).frame(width: 70, alignment: .trailing)
+                Text(settings.t("输出", "Output")).frame(width: 60, alignment: .trailing)
+                Text(settings.t("估算费用", "Est. Cost")).frame(width: 76, alignment: .trailing)
             }
             .font(.system(size: 11, weight: .semibold))
             .foregroundStyle(.secondary)
@@ -2920,31 +3038,36 @@ struct UsageDetailSection: View {
                 ForEach(snapshot.activeDailyRows) { day in
                     let dayProviders = snapshot.dayProvidersByDate[day.date] ?? []
                     let ratio = min(1, max(0.04, day.total / maxDayTokens))
-                    HStack(spacing: 12) {
+                    HStack(spacing: 8) {
                         Text(dateLabel(day.dateValue))
                             .font(.system(size: 12, weight: .medium))
                             .monospacedDigit()
-                            .frame(width: 90, alignment: .leading)
+                            .frame(width: 70, alignment: .leading)
 
-                        HStack(spacing: 5) {
+                        HStack(spacing: dayProviders.count > 6 ? 2 : 4) {
                             ForEach(dayProviders, id: \.self) { pid in
-                                ProviderBadge(id: pid, size: 13)
+                                ProviderBadge(id: pid, size: dayProviders.count > 6 ? 11 : 13)
                                     .help(providerNames[pid] ?? pid)
                             }
                         }
-                        .frame(width: 130, alignment: .leading)
+                        .frame(width: 104, alignment: .leading)
 
-                        HStack(spacing: 8) {
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 8) {
+                                Text(shortTokens(day.total))
+                                    .font(.system(size: 12, weight: .semibold, design: .rounded))
+                                    .monospacedDigit()
+                                    .frame(width: 62, alignment: .leading)
+                                ZStack(alignment: .leading) {
+                                    Capsule().fill(Color.primary.opacity(0.06))
+                                        .frame(width: 76, height: 5)
+                                    Capsule().fill(Color.accentColor.opacity(0.65))
+                                        .frame(width: max(4, 76 * ratio), height: 5)
+                                }
+                            }
                             Text(shortTokens(day.total))
                                 .font(.system(size: 12, weight: .semibold, design: .rounded))
                                 .monospacedDigit()
-                                .frame(width: 62, alignment: .leading)
-                            ZStack(alignment: .leading) {
-                                Capsule().fill(Color.primary.opacity(0.06))
-                                    .frame(width: 76, height: 5)
-                                Capsule().fill(Color.accentColor.opacity(0.65))
-                                    .frame(width: max(4, 76 * ratio), height: 5)
-                            }
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
 
@@ -2952,25 +3075,25 @@ struct UsageDetailSection: View {
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
-                            .frame(width: 78, alignment: .trailing)
+                            .frame(width: 64, alignment: .trailing)
 
                         Text(day.detailed ? shortTokens(day.cached) : "—")
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
-                            .frame(width: 84, alignment: .trailing)
+                            .frame(width: 70, alignment: .trailing)
 
                         Text(day.detailed ? shortTokens(day.output) : "—")
                             .font(.system(size: 11.5))
                             .foregroundStyle(.secondary)
                             .monospacedDigit()
-                            .frame(width: 74, alignment: .trailing)
+                            .frame(width: 60, alignment: .trailing)
 
                         Text(day.knownCost > 0 ? money(day.knownCost) : "—")
                             .font(.system(size: 12, weight: .semibold, design: .rounded))
                             .foregroundStyle(day.knownCost > 0 ? .primary : .secondary)
                             .monospacedDigit()
-                            .frame(width: 82, alignment: .trailing)
+                            .frame(width: 76, alignment: .trailing)
                     }
                     .padding(.horizontal, 12)
                     .padding(.vertical, 8)
@@ -2979,6 +3102,8 @@ struct UsageDetailSection: View {
             }
             .padding(.top, 4)
         }
+        .lineLimit(1)
+        .minimumScaleFactor(0.85)
     }
 
     private var modelListView: some View {
@@ -3260,29 +3385,20 @@ struct QuotaView: View {
     private var overviewStrip: some View {
         ViewThatFits(in: .horizontal) {
             HStack(spacing: 12) {
-                ForEach(activeProviders) { provider in overviewTile(provider) }
+                ForEach(activeProviders) { provider in singleOverviewTile(provider) }
             }
             LazyVGrid(columns: [GridItem(.flexible(), spacing: 12), GridItem(.flexible(), spacing: 12)], spacing: 12) {
-                ForEach(activeProviders) { provider in overviewTile(provider) }
+                ForEach(activeProviders) { provider in singleOverviewTile(provider) }
             }
         }
     }
 
-    private func overviewTile(_ provider: ProviderUsage) -> some View {
-        let primary = provider.primary(settings.quotaMode)
+    private func singleOverviewTile(_ provider: ProviderUsage) -> some View {
+        let primary = provider.primary()
         let pct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
         let ratio = max(0, min(1, primary?.remaining ?? 0))
         return VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 6) {
-                ProviderBadge(id: provider.id, size: 14)
-                Text(provider.name).font(.system(size: 12, weight: .semibold))
-                    .lineLimit(1)
-                    .layoutPriority(1)
-                Spacer(minLength: 0)
-                if let plan = provider.plan, !plan.isEmpty {
-                    Text(plan).font(.system(size: 10)).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
+            overviewHeader(provider)
             Text(primary?.remaining.map { QuotaWindows.percentageText($0) } ?? "—")
                 .font(.system(size: 26, weight: .bold, design: .rounded))
                 .foregroundStyle(statusColor(pct))
@@ -3294,25 +3410,46 @@ struct QuotaView: View {
                 .lineLimit(2)
                 .fixedSize(horizontal: false, vertical: true)
                 .frame(minHeight: 26, alignment: .topLeading)
-            let tint = providerColor(provider.id)
-            Canvas { context, size in
-                let track = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: size.height / 2)
-                context.fill(track, with: .color(.primary.opacity(0.08)))
-                let fillWidth = max(0, min(size.width, size.width * ratio))
-                if fillWidth > 0 {
-                    let fillPath = Path(roundedRect: CGRect(x: 0, y: 0, width: fillWidth, height: size.height), cornerRadius: size.height / 2)
-                    context.fill(fillPath, with: .color(tint))
-                }
-            }.frame(height: 5)
+            quotaBar(ratio: ratio, tint: providerColor(provider.id))
         }
         .padding(14)
         .frame(minWidth: 160, maxWidth: .infinity, alignment: .leading)
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
     }
 
+    private func overviewHeader(_ provider: ProviderUsage) -> some View {
+        HStack(spacing: 6) {
+            ProviderBadge(id: provider.id, size: 14)
+            Text(provider.name).font(.system(size: 12, weight: .semibold))
+                .lineLimit(1)
+                .layoutPriority(1)
+            Spacer(minLength: 0)
+            if let plan = provider.plan, !plan.isEmpty {
+                Text(plan)
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .fixedSize(horizontal: true, vertical: false)
+            }
+        }
+    }
+
+    private func quotaBar(ratio: Double, tint: Color) -> some View {
+        Canvas { context, size in
+            let track = Path(roundedRect: CGRect(origin: .zero, size: size), cornerRadius: size.height / 2)
+            context.fill(track, with: .color(.primary.opacity(0.08)))
+            let fillWidth = max(0, min(size.width, size.width * ratio))
+            if fillWidth > 0 {
+                let fillPath = Path(roundedRect: CGRect(x: 0, y: 0, width: fillWidth, height: size.height), cornerRadius: size.height / 2)
+                context.fill(fillPath, with: .color(tint))
+            }
+        }.frame(height: 5)
+    }
+
     private func providerCard(_ provider: ProviderUsage) -> some View {
-        let primary = provider.primary(settings.quotaMode)
-        let primaryPct = primary?.remaining.map { QuotaWindows.displayedPercent($0) }
+        let metrics = provider.cardMetrics
+        let headline = provider.primary()
+        let primaryPct = headline?.remaining.map { QuotaWindows.displayedPercent($0) }
         return VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .center, spacing: 8) {
                 ProviderBadge(id: provider.id, size: 18)
@@ -3323,9 +3460,10 @@ struct QuotaView: View {
                     Text(plan)
                         .font(.system(size: 11, weight: .medium))
                         .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .fixedSize(horizontal: true, vertical: false)
                         .padding(.horizontal, 8).padding(.vertical, 2)
                         .background(Color.primary.opacity(0.06), in: Capsule())
-                        .lineLimit(1)
                 }
                 Spacer()
                 if provider.stale {
@@ -3335,14 +3473,14 @@ struct QuotaView: View {
                 }
             }
             Divider()
-            if provider.visibleMetrics.isEmpty {
+            if metrics.isEmpty {
                 Text(settings.t("未提供剩余额度", "No quota info available"))
                     .font(.system(size: 12))
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity, minHeight: 68, alignment: .center)
             } else {
                 VStack(spacing: 14) {
-                    ForEach(provider.visibleMetrics) { metric in
+                    ForEach(metrics) { metric in
                         metricRow(metric, color: providerColor(provider.id))
                     }
                 }
@@ -3354,13 +3492,13 @@ struct QuotaView: View {
         .background(Color(nsColor: .controlBackgroundColor), in: RoundedRectangle(cornerRadius: 12))
     }
 
-    private func metricRow(_ metric: Metric, color: Color) -> some View {
+    private func metricRow(_ metric: Metric, color: Color, title: String? = nil) -> some View {
         let ratio = max(0, min(1, metric.remaining ?? 0))
         let remPct = QuotaWindows.displayedPercent(ratio)
         let usedPct = QuotaWindows.percentageText(1 - ratio)
         return VStack(alignment: .leading, spacing: 7) {
             HStack(alignment: .firstTextBaseline, spacing: 6) {
-                Text(settings.localizedMetricName(metric))
+                Text(title ?? settings.localizedMetricName(metric))
                     .font(.system(size: 13, weight: .medium))
                     .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
@@ -3452,12 +3590,6 @@ struct SettingsView: View {
                     Text(settings.t("完整名称与剩余额度", "Full Name & Remaining Quota")).tag("names")
                     Text(settings.t("仅应用图标", "App Icon Only")).tag("icon")
                 }
-                Picker(settings.t("显示哪个周期", "Quota Priority"), selection: $settings.quotaMode) {
-                    Text(settings.t("5h内额度优先", "5h Quota First")).tag("current")
-                    Text(settings.t("每周额度优先", "Weekly Quota First")).tag("weekly")
-                    Text(settings.t("每月额度优先", "Monthly Quota First")).tag("monthly")
-                    Text(settings.t("显示最紧的额度", "Tightest Quota First")).tag("minimum")
-                }
                 ForEach(quotaOrder, id: \.self) { id in
                     Toggle(isOn: Binding(get: { settings.shownProviders.contains(id) }, set: { value in
                         if value { settings.shownProviders.insert(id) } else { settings.shownProviders.remove(id) }
@@ -3471,7 +3603,7 @@ struct SettingsView: View {
                 Button(settings.t("恢复菜单栏位置", "Reset Menu Bar Position")) {
                     NotificationCenter.default.post(name: .restoreAicostMenu, object: nil)
                 }
-                Text(settings.t("状态栏在周额度、月额度未用完时显示 5 小时剩余；没有 5 小时窗口时显示月额度。周额度或月额度用完后，状态栏显示 0%，不再显示 5 小时额度。上方周期选项用于额度页面。", "While the weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. Once either allowance is used up, the menu bar shows 0% and hides the 5-hour balance. The priority picker above applies to the quota page."))
+                Text(settings.t("状态栏在周额度、月额度未用完时显示 5 小时剩余；没有 5 小时窗口时显示月额度。周额度或月额度用完后，状态栏显示 0%，不再显示 5 小时额度。点击状态栏后，Antigravity 显示 Gemini·5h内额度与每周。", "While the weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. Once either allowance is used up, the menu bar shows 0% and hides the 5-hour balance. The Antigravity row in the menu summary shows Gemini·5h and Weekly."))
                     .font(.system(size: 10)).foregroundStyle(.secondary)
             }
             Section(settings.t("其他订阅 / 应用（可选）", "Other Subscriptions / Apps (Optional)")) {

@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.0.3 — 2026-10-19
+
+- Publish local usage before remote quota requests finish, overlap independent quota lookups and coalesce repeated refreshes. Local log changes update statistics without repeatedly querying every quota provider.
+- Cache unchanged Claude usage files, stream changed logs, reuse date parsers and build analysis snapshots on demand. Avoid duplicate startup scans and refreshes triggered by the helper's own cache writes.
+- Read Antigravity subscription types from both the client and optional `agy` CLI loopback status APIs, preferring the actual subscription tier. Keep known plans when generic quota summaries leave the plan blank.
+- Include Antigravity desktop, CLI and IDE conversation databases in token totals. Keep Gemini 5-hour and weekly balances distinct from the other-model pool in the menu summary and quota cards.
+- Fit daily usage columns within the default window without horizontal scrolling. Preserve token totals when there is insufficient room for their decorative bars.
+- Remove the quota-priority setting, which did not control the menu bar. Keep the existing default priority and exhausted-week/month behavior.
+- Retry only local collection if the device time zone changes during a scan. Reject invalid usage fragments and avoid overflow when merging streaming token counters.
+- Add isolated regressions for early local publication, refresh coalescing, response ordering, failure recovery, Claude file-cache invalidation and CLI-only subscription plans.
+
 ## 1.0.2 — 2026-10-19
 
 - The menu bar shows the 5-hour balance while the weekly and monthly allowances remain, or the monthly balance when there is no 5-hour window. A used-up weekly or monthly allowance replaces that figure with 0% and the 5-hour balance leaves the menu bar.

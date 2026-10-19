@@ -18,13 +18,14 @@ All interface previews use synthetic demo data. They contain no real account or 
 
 ## Download
 
-Download **Aicost-1.0.2-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
+Download **Aicost-1.0.3-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
 
 ## Features
 
-- Menu bar quota icons, names and remaining percentages. While weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. A used-up weekly or monthly allowance shows 0% and hides the 5-hour balance.
-- Quota cards keep the 5-hour, weekly and monthly windows together.
-- Daily stacked usage, per-app shares and model breakdowns.
+- Menu bar quota icons, names and remaining percentages. While weekly and monthly allowances remain, the menu bar shows the 5-hour balance, or the monthly balance when there is no 5-hour window. A used-up weekly or monthly allowance shows 0% and hides the 5-hour balance. The Antigravity row in the menu summary shows Gemini's 5-hour and weekly balances.
+- Quota cards keep the 5-hour, weekly and monthly windows together. Antigravity's card shows only Gemini.
+- Daily stacked usage, per-app shares and model breakdowns; daily columns fit the default window without horizontal scrolling.
+- Local statistics update independently of remote quotas, with cached Claude file scans and coalesced refreshes. Antigravity subscription labels can come from the desktop client or optional `agy` CLI.
 - Today, this month, past 7/30 days and custom ranges up to 31 days.
 - English and Simplified Chinese, with responsive quota cards.
 - Daily grouping and reset times follow the device's current time zone, including daylight saving time. App error messages follow the selected interface language.

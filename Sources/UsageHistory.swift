@@ -70,6 +70,76 @@ enum LocalCommand {
     }
 }
 
+struct AntigravitySupplement {
+    var windows: [AntigravityGeminiQuota.PoolWindow] = []
+    var plan: String? = nil
+}
+
+/// Query only the current user's Antigravity loopback servers. The CLI started
+/// by Aicost gets a fresh CSRF token, so no Keychain prompt or token export is
+/// needed to read its subscription type. Never log process arguments or bodies.
+enum AntigravityLocalPlan {
+    static func flag(_ name: String, in command: String) -> String? {
+        let pattern = "(?:^|\\s)" + NSRegularExpression.escapedPattern(for: name) + "(?:=|\\s+)([^\\s]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: command, range: NSRange(command.startIndex..., in: command)),
+              let range = Range(match.range(at: 1), in: command) else { return nil }
+        let value = String(command[range]).trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+        return value.isEmpty ? nil : value
+    }
+
+    static func ports(from listing: String) -> [Int] {
+        Array(Set(listing.split(whereSeparator: \.isNewline).compactMap { line -> Int? in
+            guard line.hasPrefix("n"), let last = line.split(separator: ":").last,
+                  let port = Int(last), (1...65535).contains(port) else { return nil }
+            return port
+        })).sorted()
+    }
+
+    static func read(expectedCSRF: String? = nil, waitForLaunch: Bool = false) -> String? {
+        let deadline = ProcessInfo.processInfo.systemUptime + (waitForLaunch ? 8 : 3)
+        repeat {
+            guard let listing = try? LocalCommand.run(executable: URL(fileURLWithPath: "/bin/ps"),
+                arguments: ["-U", String(getuid()), "-ww", "-o", "pid=,args="], timeout: 0.5), listing.status == 0 else { return nil }
+            let rows = String(decoding: listing.data, as: UTF8.self).split(whereSeparator: \.isNewline)
+            for row in rows {
+                let fields = row.split(maxSplits: 1, whereSeparator: \.isWhitespace)
+                guard fields.count == 2, let pid = Int32(fields[0]) else { continue }
+                let command = String(fields[1])
+                let executable = command.split(whereSeparator: \.isWhitespace).first.map(String.init) ?? ""
+                let isCLI = URL(fileURLWithPath: executable).lastPathComponent == "agy"
+                let isClient = executable.lowercased().contains("antigravity") && executable.contains("language_server")
+                guard isCLI || isClient,
+                      let csrf = flag("--csrf_token", in: command),
+                      expectedCSRF == nil || csrf == expectedCSRF else { continue }
+                guard let listeners = try? LocalCommand.run(executable: URL(fileURLWithPath: "/usr/sbin/lsof"),
+                    arguments: ["-nP", "-a", "-p", String(pid), "-iTCP", "-sTCP:LISTEN", "-Fn"], timeout: 0.7) else { continue }
+                var available = ports(from: String(decoding: listeners.data, as: UTF8.self))
+                if let value = flag("--extension_server_port", in: command), let port = Int(value),
+                   (1...65535).contains(port), !available.contains(port) { available.append(port) }
+                for port in available.prefix(4) {
+                    for scheme in ["https", "http"] {
+                        let remaining = deadline - ProcessInfo.processInfo.systemUptime
+                        guard remaining > 0.1 else { return nil }
+                        let timeout = min(1.5, remaining)
+                        let url = "\(scheme)://127.0.0.1:\(port)/exa.language_server_pb.LanguageServerService/GetUserStatus"
+                        let body = #"{"metadata":{"ideName":"antigravity","extensionName":"antigravity","ideVersion":"unknown","locale":"en"}}"#
+                        let arguments = ["--silent", "--fail", "--insecure", "--noproxy", "*", "--connect-timeout", "0.3",
+                            "--max-time", String(timeout), "-H", "Content-Type: application/json", "-H", "Connect-Protocol-Version: 1",
+                            "-H", "x-codeium-csrf-token: " + csrf, "-d", body, url]
+                        if let result = try? LocalCommand.run(executable: URL(fileURLWithPath: "/usr/bin/curl"),
+                            arguments: arguments, timeout: timeout + 0.2, maxOutputBytes: 2_097_152), result.status == 0,
+                           let plan = AntigravityGeminiQuota.subscriptionPlan(from: result.data) { return plan }
+                    }
+                }
+            }
+            if !waitForLaunch { return nil }
+            Thread.sleep(forTimeInterval: 0.15)
+        } while ProcessInfo.processInfo.systemUptime < deadline
+        return nil
+    }
+}
+
 struct UsageModel: Codable, Identifiable {
     var id: String { name }
     let name: String
@@ -145,6 +215,13 @@ struct CodexFileCache: Codable {
     let size: UInt64
     let modified: Date
     let records: [UsageRecord]
+}
+
+/// Contains only hashed message identities and numeric usage metadata.
+struct ClaudeFileCache: Codable {
+    let size: UInt64
+    let modified: Date
+    let messages: [String: UsageRecord]
 }
 
 struct AntigravityFileCache: Codable {
@@ -407,35 +484,9 @@ enum HistoryAnalyzer {
             warnings.removeAll { $0 == "logs-pending:grok" }
         }
 
-        let claude = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
-        var messages: [String: UsageRecord] = [:]
-        let enumerator = FileManager.default.enumerator(at: claude, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles])
-        while let url = enumerator?.nextObject() as? URL {
-            guard url.pathExtension == "jsonl", let data = try? Data(contentsOf: url),
-                  let text = String(data: data, encoding: .utf8) else { continue }
-            for line in text.split(separator: "\n") {
-                guard let data = line.data(using: .utf8),
-                      let row = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                      row["type"] as? String == "assistant",
-                      let message = row["message"] as? [String: Any],
-                      let usage = message["usage"] as? [String: Any],
-                      let date = (row["timestamp"] as? String).flatMap(parseDate),
-                      let model = message["model"] as? String, !model.contains("synthetic") else { continue }
-                let key = (message["id"] as? String ?? row["uuid"] as? String ?? "") + ":" + (row["requestId"] as? String ?? "")
-                let previous = messages[key]
-                let input = max(previous?.input ?? 0, usage["input_tokens"] as? Double ?? 0)
-                let cached = max(previous?.cached ?? 0, usage["cache_read_input_tokens"] as? Double ?? 0)
-                let written = max(previous?.written ?? 0, usage["cache_creation_input_tokens"] as? Double ?? 0)
-                let output = max(previous?.output ?? 0, usage["output_tokens"] as? Double ?? 0)
-                let total = input + cached + written + output
-                guard total > 0 else { continue }
-                let cost = catalog.estimate(model: model, input: input, cached: cached, written: written, output: output)
-                messages[key] = UsageRecord(date: previous?.date ?? date, model: model, input: input, cached: cached,
-                                           written: written, output: output, total: total, cost: cost)
-            }
-        }
-        if !messages.isEmpty {
-            for day in aggregate(Array(messages.values), provider: "claude", timeZone: collectionZone) { merged[day.id] = day }
+        let claudeRecords = scanClaude(catalog: catalog, support: support)
+        if !claudeRecords.isEmpty {
+            for day in aggregate(claudeRecords, provider: "claude", timeZone: collectionZone) { merged[day.id] = day }
             sources["claude"] = "claude-local-logs"
         }
 
@@ -474,18 +525,38 @@ enum HistoryAnalyzer {
         return groups.values.sorted { $0.date < $1.date }
     }
 
-    static func scanAntigravity(catalog: PriceCatalog, support: URL) -> [UsageRecord] {
-        let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".gemini/antigravity/conversations")
+    /// Desktop app, `agy` CLI and Antigravity IDE each keep their own conversation databases.
+    static func antigravityConversationRoots(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> [URL] {
+        let gemini = home.appendingPathComponent(".gemini")
+        return [
+            "antigravity/conversations",
+            "antigravity-cli/conversations",
+            "antigravity-ide/conversations"
+        ].map { gemini.appendingPathComponent($0) }
+    }
+
+    static func scanAntigravity(catalog: PriceCatalog, support: URL, roots: [URL]? = nil) -> [UsageRecord] {
         let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v3")
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         let fm = FileManager.default
-        guard let urls = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { return [] }
+        var records: [UsageRecord] = []
+        var seenRoots = Set<String>()
+        for root in roots ?? antigravityConversationRoots() {
+            let resolved = root.resolvingSymlinksInPath().standardizedFileURL
+            guard seenRoots.insert(resolved.path).inserted,
+                  let urls = try? fm.contentsOfDirectory(at: resolved, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) else { continue }
+            records.append(contentsOf: scanAntigravityDatabases(urls, catalog: catalog, cache: cache, fileManager: fm))
+        }
+        return records
+    }
+
+    private static func scanAntigravityDatabases(_ urls: [URL], catalog: PriceCatalog, cache: URL, fileManager: FileManager) -> [UsageRecord] {
         var records: [UsageRecord] = []
         for url in urls where url.pathExtension == "db" {
-            guard let attrs = try? fm.attributesOfItem(atPath: url.path),
+            guard let attrs = try? fileManager.attributesOfItem(atPath: url.path),
                   let dbSize = (attrs[.size] as? NSNumber)?.uint64Value,
                   let dbModified = attrs[.modificationDate] as? Date else { continue }
-            let walAttrs = try? fm.attributesOfItem(atPath: url.path + "-wal")
+            let walAttrs = try? fileManager.attributesOfItem(atPath: url.path + "-wal")
             let walSize = (walAttrs?[.size] as? NSNumber)?.uint64Value ?? 0
             let walModified = (walAttrs?[.modificationDate] as? Date) ?? Date.distantPast
             let name = SHA256.hash(data: Data(url.path.utf8)).map { String(format: "%02x", $0) }.joined()
@@ -725,6 +796,93 @@ enum HistoryAnalyzer {
         return records
     }
 
+    private static func mergeClaudeRecord(_ incoming: UsageRecord, with previous: UsageRecord?, catalog: PriceCatalog) -> UsageRecord {
+        let input = max(previous?.input ?? 0, incoming.input)
+        let cached = max(previous?.cached ?? 0, incoming.cached)
+        let written = max(previous?.written ?? 0, incoming.written)
+        let output = max(previous?.output ?? 0, incoming.output)
+        let total = input + cached + written + output
+        // Individually valid streaming fragments can overflow when merged.
+        guard total.isFinite else { return previous ?? incoming }
+        return UsageRecord(date: min(previous?.date ?? incoming.date, incoming.date), model: incoming.model,
+                           input: input, cached: cached, written: written, output: output,
+                           total: total,
+                           cost: catalog.estimate(model: incoming.model, input: input, cached: cached, written: written, output: output))
+    }
+
+    static func scanClaude(catalog: PriceCatalog, support: URL, root: URL? = nil) -> [UsageRecord] {
+        let root = root ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/projects")
+        let cache = storageFolder(support: support).appendingPathComponent("claude-file-cache-v1")
+        let fm = FileManager.default
+        try? fm.createDirectory(at: cache, withIntermediateDirectories: true)
+        let enumerator = fm.enumerator(at: root, includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey], options: [.skipsHiddenFiles])
+        var messages: [String: UsageRecord] = [:]
+        while let url = enumerator?.nextObject() as? URL {
+            guard url.pathExtension == "jsonl", let attrs = try? fm.attributesOfItem(atPath: url.path),
+                  let size = (attrs[.size] as? NSNumber)?.uint64Value, let modified = attrs[.modificationDate] as? Date else { continue }
+            let name = SHA256.hash(data: Data(url.path.utf8)).map { String(format: "%02x", $0) }.joined()
+            let file = cache.appendingPathComponent(name + ".json")
+            let parsed: [String: UsageRecord]
+            if let data = try? Data(contentsOf: file), let prior = try? JSONDecoder().decode(ClaudeFileCache.self, from: data),
+               prior.size == size, prior.modified == modified {
+                parsed = prior.messages
+            } else {
+                guard let fresh = parseClaudeFile(url, catalog: catalog) else { continue }
+                parsed = fresh
+                if let data = try? JSONEncoder().encode(ClaudeFileCache(size: size, modified: modified, messages: parsed)) {
+                    try? data.write(to: file, options: .atomic)
+                }
+            }
+            for (key, record) in parsed {
+                messages[key] = mergeClaudeRecord(record, with: messages[key], catalog: catalog)
+            }
+        }
+        return Array(messages.values)
+    }
+
+    static func parseClaudeFile(_ url: URL, catalog: PriceCatalog) -> [String: UsageRecord]? {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return nil }
+        defer { try? handle.close() }
+        var messages: [String: UsageRecord] = [:]
+        var lineNumber = 0
+        func consume(_ line: Data.SubSequence) {
+            lineNumber += 1
+            guard let row = try? JSONSerialization.jsonObject(with: Data(line)) as? [String: Any],
+                  row["type"] as? String == "assistant",
+                  let message = row["message"] as? [String: Any],
+                  let usage = message["usage"] as? [String: Any],
+                  let date = (row["timestamp"] as? String).flatMap(parseDate),
+                  let model = message["model"] as? String, !model.contains("synthetic") else { return }
+            let identity = (message["id"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? (row["uuid"] as? String).flatMap { $0.isEmpty ? nil : $0 }
+                ?? "\(url.path):\(lineNumber)"
+            let rawKey = identity + ":" + (row["requestId"] as? String ?? "")
+            let key = SHA256.hash(data: Data(rawKey.utf8)).map { String(format: "%02x", $0) }.joined()
+            let input = usage["input_tokens"] as? Double ?? 0
+            let cached = usage["cache_read_input_tokens"] as? Double ?? 0
+            let written = usage["cache_creation_input_tokens"] as? Double ?? 0
+            let output = usage["output_tokens"] as? Double ?? 0
+            let total = input + cached + written + output
+            guard [input, cached, written, output, total].allSatisfy({ $0.isFinite && $0 >= 0 }), total > 0 else { return }
+            let record = UsageRecord(date: date, model: model, input: input, cached: cached, written: written,
+                                     output: output, total: total, cost: nil)
+            messages[key] = mergeClaudeRecord(record, with: messages[key], catalog: catalog)
+        }
+        var buffer = Data()
+        do {
+            while let chunk = try handle.read(upToCount: 2_097_152), !chunk.isEmpty {
+                buffer.append(chunk)
+                var offset = buffer.startIndex
+                while offset < buffer.endIndex, let newline = buffer[offset...].firstIndex(of: 10) {
+                    consume(buffer[offset..<newline]); offset = newline + 1
+                }
+                if offset > buffer.startIndex { buffer.removeSubrange(buffer.startIndex..<offset) }
+            }
+        } catch { return nil }
+        if !buffer.isEmpty { consume(buffer[...]) }
+        return messages
+    }
+
     static func scanGrok(catalog: PriceCatalog, support: URL) -> [UsageRecord] {
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".grok/sessions")
         let cache = storageFolder(support: support).appendingPathComponent("grok-usage-cache")
@@ -833,9 +991,17 @@ enum HistoryAnalyzer {
     }
 
     static func parseDate(_ value: String) -> Date? {
-        let formatter = ISO8601DateFormatter()
-        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+        let key = "Aicost.ISO8601Formatters"
+        let formatters: [ISO8601DateFormatter]
+        if let prior = Thread.current.threadDictionary[key] as? [ISO8601DateFormatter] {
+            formatters = prior
+        } else {
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            formatters = [fractional, ISO8601DateFormatter()]
+            Thread.current.threadDictionary[key] = formatters
+        }
+        return formatters[0].date(from: value) ?? formatters[1].date(from: value)
     }
 
     static func apiDate(_ label: String, reference: Date, timeZone: TimeZone = zone) -> Date? {
@@ -850,8 +1016,9 @@ enum HistoryAnalyzer {
     }
 }
 
-/// Gemini is the Antigravity subscription that Pro accounts can spend. `agy /usage` reports its
-/// 5-hour and weekly windows; the Cloud Code summary often returns only the other-model pool.
+/// Gemini is the Antigravity subscription that Pro accounts can spend. `agy /usage` reports both
+/// pools. The Cloud Code summary often copies the other-model pool into the Gemini slots, so those
+/// summary values must not replace a Gemini reading already learned from `agy`.
 enum AntigravityGeminiQuota {
     struct Window {
         var remaining: Double
@@ -862,13 +1029,31 @@ enum AntigravityGeminiQuota {
         var id: String
         var remaining: Double
         var reset: Date?
-        var kind: QuotaWindowKind { id == "geminiWeekly" ? .weekly : .session }
+        var kind: QuotaWindowKind {
+            let key = id.lowercased()
+            if key.contains("week") { return .weekly }
+            if key.contains("month") { return .monthly }
+            return .session
+        }
     }
 
     static func merging(_ windows: [PoolWindow], into existing: [Metric]) -> [Metric] {
         let incoming = windows.map { Metric(id: $0.id, remaining: $0.remaining, reset: $0.reset, kind: $0.kind) }
         let updated = Set(incoming.map(\.id))
         return distinctMetrics(incoming + existing.filter { !updated.contains($0.labelID ?? $0.id) })
+    }
+
+    /// Keep the last Gemini windows. A summary refresh may update the other-model pool, but its
+    /// Gemini slots are not authoritative and must not move the menu bar onto that pool.
+    static func mergingProvider(incoming: [Metric], retained: [Metric]) -> [Metric] {
+        let others = incoming.filter { QuotaWindows.pool(of: $0.id) != "gemini" }
+        let replaced = Set(others.map { $0.labelID ?? $0.id })
+        let kept = retained.filter { metric in
+            let pool = QuotaWindows.pool(of: metric.id)
+            if pool == "gemini" { return true }
+            return pool == "other" && !replaced.contains(metric.labelID ?? metric.id)
+        }
+        return distinctMetrics(kept + others)
     }
 
     static func pools(fromAgy data: Data) -> [PoolWindow] {
@@ -880,19 +1065,26 @@ enum AntigravityGeminiQuota {
                 for bucket in group["buckets"] as? [[String: Any]] ?? [] {
                     if bucket["disabled"] as? Bool == true { continue }
                     let bucketID = (bucket["id"] as? String)?.lowercased() ?? ""
-                    guard bucketID.contains("gemini") else { continue }
+                    let groupName = (group["name"] as? String)?.lowercased() ?? ""
                     guard let fraction = finiteFraction(bucket["remaining_fraction"] ?? bucket["remainingFraction"]) else { continue }
                     let window = (bucket["window"] as? String)?.lowercased() ?? ""
                     let weekly = bucketID.contains("week") || window == "weekly"
+                    let gemini = bucketID.contains("gemini") || groupName.contains("gemini")
                     let reset = (bucket["reset_time"] as? String ?? bucket["resetTime"] as? String).flatMap(HistoryAnalyzer.parseDate)
-                    let id = weekly ? "geminiWeekly" : "geminiSession"
+                    let id = gemini ? (weekly ? "geminiWeekly" : "geminiSession") : (weekly ? "nonGeminiWeekly" : "nonGeminiSession")
                     guard !windows.contains(where: { $0.id == id }) else { continue }
                     windows.append(PoolWindow(id: id, remaining: min(1, max(0, fraction)), reset: reset))
                 }
             }
             if !windows.isEmpty { break }
         }
-        return windows.sorted { $0.kind.rawValue < $1.kind.rawValue }
+        return windows.sorted { lhs, rhs in
+            if lhs.kind != rhs.kind { return lhs.kind < rhs.kind }
+            let lhsOther = lhs.id.lowercased().contains("nongemini")
+            let rhsOther = rhs.id.lowercased().contains("nongemini")
+            if lhsOther != rhsOther { return !lhsOther }
+            return lhs.id < rhs.id
+        }
     }
 
     private static func agyPayloads(_ data: Data) -> [[String: Any]] {
@@ -950,6 +1142,52 @@ enum AntigravityGeminiQuota {
         }
         guard let worst else { return nil }
         return Window(remaining: worst, reset: reset)
+    }
+
+    /// `paidTier.id` from Cloud Code `loadCodeAssist`. The display name is longer and less stable.
+    private static let paidTierPlans = [
+        "g1-pro-tier": "Pro",
+        "g1-ultra-tier": "Ultra",
+        "g1-ultra-lite-tier": "Ultra Lite"
+    ]
+
+    /// Subscription type for the card corner. Gemini is a quota pool, not a plan name.
+    static func subscriptionPlan(from data: Data) -> String? {
+        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any], root["error"] == nil else { return nil }
+        let status = root["userStatus"] as? [String: Any] ?? root
+        // The actual subscription tier takes precedence over the inherited
+        // language-server plan, which can say Pro for an Ultra account.
+        for key in ["userTier", "paidTier"] {
+            if let tier = status[key] as? [String: Any] {
+                if let id = tier["id"] as? String, let known = paidTierPlans[id] { return known }
+                if let label = planLabel(tier["name"] as? String) { return label }
+            }
+        }
+        if let current = status["currentTier"] as? [String: Any] {
+            if let id = current["id"] as? String, let known = paidTierPlans[id] { return known }
+            if let label = planLabel(current["name"] as? String) { return label }
+        }
+        if let planStatus = status["planStatus"] as? [String: Any],
+           let info = planStatus["planInfo"] as? [String: Any] {
+            return planLabel(info["planName"] as? String)
+        }
+        return nil
+    }
+
+    private static func planLabel(_ raw: String?) -> String? {
+        guard let trimmed = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
+        let folded = trimmed.lowercased()
+        if folded == "gemini" || folded == "antigravity" { return nil }
+        let prefix = "google ai "
+        if folded.hasPrefix(prefix) {
+            let rest = String(trimmed.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            return rest.isEmpty ? nil : rest
+        }
+        for keyword in ["Ultra Lite", "Ultra", "Pro", "Free"] {
+            let pattern = "\\b" + NSRegularExpression.escapedPattern(for: keyword) + "\\b"
+            if trimmed.range(of: pattern, options: [.regularExpression, .caseInsensitive]) != nil { return keyword }
+        }
+        return trimmed
     }
 }
 
@@ -1033,7 +1271,40 @@ enum QuotaWindows {
         return remaining > 0 && remaining < 0.01 ? "<1%" : "\(displayedPercent(remaining))%"
     }
 
-    /// Antigravity reports two independent pools. Gemini is the main pool and the one the menu bar follows.
+    /// Quota-page rows. Antigravity shows the Gemini pool only.
+    static func cardReadings(_ readings: [QuotaReading], provider: String) -> [QuotaReading] {
+        let ordered = orderedIndices(readings).map { readings[$0] }
+        guard provider == "antigravity" else { return ordered }
+        return ordered.filter { pool(of: $0.id) == "gemini" }
+    }
+
+    /// Menu-bar text for Antigravity: Gemini's 5-hour window and its week, together.
+    static func antigravityMenuLabel(_ readings: [QuotaReading], english: Bool) -> String? {
+        let preferred = preferredPoolIndices(readings)
+        guard !preferred.isEmpty else { return nil }
+        let selected = orderedIndices(preferred.map { readings[$0] }).map { readings[preferred[$0]] }
+        let hasSession = selected.contains { $0.kind == .session }
+        let parts = selected.map { reading -> String in
+            let percent = percentageText(reading.remaining ?? 0)
+            switch reading.kind {
+            case .session:
+                return english ? "Gemini·5h \(percent)" : "Gemini·5h内额度 \(percent)"
+            case .weekly:
+                if hasSession { return english ? "Weekly \(percent)" : "每周 \(percent)" }
+                return english ? "Gemini·Weekly \(percent)" : "Gemini·每周 \(percent)"
+            case .monthly:
+                return english ? "Monthly \(percent)" : "每月 \(percent)"
+            case .daily:
+                return english ? "Daily \(percent)" : "每日 \(percent)"
+            case .other:
+                return "\(reading.id) \(percent)"
+            }
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    /// Antigravity reports two independent pools. Gemini is the only pool on the menu bar and quota card.
+    /// Spark stays off the menu bar while a regular pool exists.
     static func pool(of id: String) -> String {
         let key = id.lowercased()
         if key.contains("nongemini") { return "other" }
@@ -1048,7 +1319,7 @@ enum QuotaWindows {
         if !gemini.isEmpty { return Array(gemini) }
         let main = available.filter { pool(of: readings[$0].id) == "main" }
         if !main.isEmpty { return Array(main) }
-        return Array(available)
+        return available.filter { pool(of: readings[$0].id) != "other" }
     }
 
     static func orderedIndices(_ readings: [QuotaReading]) -> [Int] {
