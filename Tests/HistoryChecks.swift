@@ -290,6 +290,57 @@ struct HistoryChecks {
         guard inserted == SQLITE_DONE else { throw NSError(domain: "AicostTest", code: 4) }
     }
 
+    static func writeConversationDBWithSteps(_ url: URL, model: String, input: UInt64, output: UInt64, stepIndex: UInt64, timestamp: UInt64) throws {
+        let usage = Data([0x08]) + varint(input) + Data([0x18]) + varint(output)
+        let lastStepKV = field(1, Data("last_step_index".utf8)) + field(2, Data(String(stepIndex).utf8))
+        let blob = field(1, field(4, usage) + field(19, Data(model.utf8)) + field(20, lastStepKV))
+        var db: OpaquePointer?
+        guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else { throw NSError(domain: "AicostTest", code: 1) }
+        defer { sqlite3_close(db) }
+        guard sqlite3_exec(db, "CREATE TABLE gen_metadata (idx INTEGER PRIMARY KEY, data BLOB, size INTEGER); CREATE TABLE steps (idx INTEGER PRIMARY KEY, metadata BLOB)", nil, nil, nil) == SQLITE_OK else {
+            throw NSError(domain: "AicostTest", code: 2)
+        }
+        var gStmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT INTO gen_metadata (idx, data, size) VALUES (1, ?, ?)", -1, &gStmt, nil) == SQLITE_OK, let gStmt else {
+            throw NSError(domain: "AicostTest", code: 3)
+        }
+        defer { sqlite3_finalize(gStmt) }
+        let insertedG = blob.withUnsafeBytes { raw -> Int32 in
+            let destructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            guard sqlite3_bind_blob(gStmt, 1, raw.baseAddress, Int32(blob.count), destructor) == SQLITE_OK else { return SQLITE_ERROR }
+            sqlite3_bind_int(gStmt, 2, Int32(blob.count))
+            return sqlite3_step(gStmt)
+        }
+        guard insertedG == SQLITE_DONE else { throw NSError(domain: "AicostTest", code: 4) }
+
+        // Step 1 has an older timestamp (must NOT be used when last_step_index points elsewhere)
+        let oldStepMeta = field(1, Data([0x08]) + varint(1_700_000_000))
+        var sStmt1: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT INTO steps (idx, metadata) VALUES (1, ?)", -1, &sStmt1, nil) == SQLITE_OK, let sStmt1 else {
+            throw NSError(domain: "AicostTest", code: 5)
+        }
+        defer { sqlite3_finalize(sStmt1) }
+        let _ = oldStepMeta.withUnsafeBytes { raw in
+            let destructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            sqlite3_bind_blob(sStmt1, 1, raw.baseAddress, Int32(oldStepMeta.count), destructor)
+            sqlite3_step(sStmt1)
+        }
+
+        // Step `stepIndex` has the target timestamp
+        let targetStepMeta = field(1, Data([0x08]) + varint(timestamp))
+        var sStmt2: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "INSERT INTO steps (idx, metadata) VALUES (?, ?)", -1, &sStmt2, nil) == SQLITE_OK, let sStmt2 else {
+            throw NSError(domain: "AicostTest", code: 6)
+        }
+        defer { sqlite3_finalize(sStmt2) }
+        sqlite3_bind_int64(sStmt2, 1, Int64(stepIndex))
+        let _ = targetStepMeta.withUnsafeBytes { raw in
+            let destructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+            sqlite3_bind_blob(sStmt2, 2, raw.baseAddress, Int32(targetStepMeta.count), destructor)
+            sqlite3_step(sStmt2)
+        }
+    }
+
     static func checkAntigravitySources(catalog: PriceCatalog) throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("aicost-agy-" + UUID().uuidString)
         let client = root.appendingPathComponent("client")
@@ -302,14 +353,16 @@ struct HistoryChecks {
         defer { try? FileManager.default.removeItem(at: root) }
         try writeConversationDB(client.appendingPathComponent("client.db"), model: "client-model", input: 5, output: 2, timestamp: 1_760_000_000)
         try writeConversationDB(cli.appendingPathComponent("cli.db"), model: "cli-model", input: 9, output: 2, timestamp: 1_760_000_100)
+        try writeConversationDBWithSteps(client.appendingPathComponent("steps.db"), model: "step-model", input: 20, output: 5, stepIndex: 50, timestamp: 1_760_000_200)
         let home = root.appendingPathComponent("home")
         let roots = HistoryAnalyzer.antigravityConversationRoots(home: home)
         assert(roots.map(\.lastPathComponent) == ["conversations", "conversations", "conversations"])
         assert(roots.map { $0.deletingLastPathComponent().lastPathComponent } == ["antigravity", "antigravity-cli", "antigravity-ide"])
         let records = HistoryAnalyzer.scanAntigravity(catalog: catalog, support: support, roots: [client, cli, link])
-        assert(records.count == 2, "client and CLI databases both count, and a symlink to the client is not counted twice")
+        assert(records.count == 3, "client and CLI databases both count, and a symlink to the client is not counted twice")
         assert(records.contains { $0.model == "client-model" && $0.total == 7 })
         assert(records.contains { $0.model == "cli-model" && $0.total == 11 })
+        assert(records.contains { $0.model == "step-model" && $0.total == 25 && $0.date == Date(timeIntervalSince1970: 1_760_000_200) })
     }
 
     static func checkMalformedHistory(catalog: PriceCatalog) {

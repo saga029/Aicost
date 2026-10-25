@@ -536,7 +536,7 @@ enum HistoryAnalyzer {
     }
 
     static func scanAntigravity(catalog: PriceCatalog, support: URL, roots: [URL]? = nil) -> [UsageRecord] {
-        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v3")
+        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v4")
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         let fm = FileManager.default
         var records: [UsageRecord] = []
@@ -595,9 +595,13 @@ enum HistoryAnalyzer {
             sqlite3_finalize(checkStmt)
         }
 
-        let sql = hasSteps
-            ? "SELECT g.idx, g.data, (SELECT metadata FROM steps WHERE idx = g.idx) FROM gen_metadata g WHERE g.data IS NOT NULL AND length(g.data) <= 524288 ORDER BY g.idx"
-            : "SELECT g.idx, g.data, NULL FROM gen_metadata g WHERE g.data IS NOT NULL AND length(g.data) <= 524288 ORDER BY g.idx"
+        var stepStmt: OpaquePointer?
+        if hasSteps {
+            sqlite3_prepare_v2(db, "SELECT metadata FROM steps WHERE idx = ? LIMIT 1", -1, &stepStmt, nil)
+        }
+        defer { if let stepStmt { sqlite3_finalize(stepStmt) } }
+
+        let sql = "SELECT g.idx, g.data FROM gen_metadata g WHERE g.data IS NOT NULL AND length(g.data) <= 524288 ORDER BY g.idx"
 
         var stmt: OpaquePointer?
         guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK, let stmt else { return [] }
@@ -605,14 +609,31 @@ enum HistoryAnalyzer {
 
         var records: [UsageRecord] = []
         while sqlite3_step(stmt) == SQLITE_ROW {
+            let gIdx = sqlite3_column_int64(stmt, 0)
             guard let blobPtr = sqlite3_column_blob(stmt, 1) else { continue }
             let blobLen = Int(sqlite3_column_bytes(stmt, 1))
             guard blobLen > 0 else { continue }
             let genData = Data(bytes: blobPtr, count: blobLen)
             var stepData: Data? = nil
-            if sqlite3_column_type(stmt, 2) != SQLITE_NULL, let stepPtr = sqlite3_column_blob(stmt, 2) {
-                let stepLen = Int(sqlite3_column_bytes(stmt, 2))
-                if stepLen > 0 { stepData = Data(bytes: stepPtr, count: stepLen) }
+            if let stepStmt, let msg1 = pbBytes(1, in: genData) {
+                let stepIdx = pbLastStepIndex(in: msg1) ?? gIdx
+                sqlite3_bind_int64(stepStmt, 1, stepIdx)
+                if sqlite3_step(stepStmt) == SQLITE_ROW, let stepPtr = sqlite3_column_blob(stepStmt, 0) {
+                    let stepLen = Int(sqlite3_column_bytes(stepStmt, 0))
+                    if stepLen > 0 { stepData = Data(bytes: stepPtr, count: stepLen) }
+                }
+                sqlite3_reset(stepStmt)
+                sqlite3_clear_bindings(stepStmt)
+
+                if stepData == nil && stepIdx != gIdx {
+                    sqlite3_bind_int64(stepStmt, 1, gIdx)
+                    if sqlite3_step(stepStmt) == SQLITE_ROW, let stepPtr = sqlite3_column_blob(stepStmt, 0) {
+                        let stepLen = Int(sqlite3_column_bytes(stepStmt, 0))
+                        if stepLen > 0 { stepData = Data(bytes: stepPtr, count: stepLen) }
+                    }
+                    sqlite3_reset(stepStmt)
+                    sqlite3_clear_bindings(stepStmt)
+                }
             }
             if let record = decodeAntigravityRow(genData: genData, stepData: stepData, catalog: catalog) {
                 records.append(record)
@@ -754,6 +775,40 @@ enum HistoryAnalyzer {
               let str = String(data: bytes, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !str.isEmpty else { return nil }
         return str
+    }
+
+    private static func pbLastStepIndex(in msg1: Data) -> Int64? {
+        var idx = 0
+        while idx < msg1.count {
+            guard let tag = pbReadVarint(msg1, &idx) else { return nil }
+            let field = Int(tag >> 3)
+            let wire = Int(tag & 0x7)
+            switch wire {
+            case 0:
+                guard pbReadVarint(msg1, &idx) != nil else { return nil }
+            case 1:
+                idx += 8
+                if idx > msg1.count { return nil }
+            case 2:
+                guard let len = pbReadVarint(msg1, &idx) else { return nil }
+                guard let length = Int(exactly: len), length <= msg1.count - idx else { return nil }
+                if field == 20 {
+                    let sub = Data(msg1[idx..<(idx + length)])
+                    if pbString(1, in: sub) == "last_step_index",
+                       let valStr = pbString(2, in: sub),
+                       let stepIdx = Int64(valStr) {
+                        return stepIdx
+                    }
+                }
+                idx += length
+            case 5:
+                idx += 4
+                if idx > msg1.count { return nil }
+            default:
+                return nil
+            }
+        }
+        return nil
     }
 
     /// Turn totals in `~/.grok/sessions/*/usage.json`. Cached tokens are already inside `inputTokens`,
