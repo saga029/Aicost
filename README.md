@@ -18,7 +18,7 @@ All interface previews use synthetic demo data. They contain no real account or 
 
 ## Download
 
-Download **Aicost-1.0.3-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
+Download **Aicost-1.0.4-macos-arm64.zip** from [Releases](https://github.com/saga029/Aicost/releases), extract it, and move `Aicost.app` to Applications. This release uses an ad-hoc signature and is not Apple-notarized; macOS may require approval through Finder / Privacy & Security on first launch.
 
 ## Features
 

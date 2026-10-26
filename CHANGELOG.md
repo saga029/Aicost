@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.4 — 2026-10-26
+
+- Date Antigravity usage using the generation's `last_step_index` rather than the unrelated generation row index. Honor the final value when the protobuf map repeats a key.
+- Avoid assigning an unrelated old timestamp when a referenced step is missing. Records with their own timestamp still count, and older records without a step reference retain their legacy lookup.
+- Rebuild Antigravity file caches and outdated daily buckets so corrected dates do not leave duplicate historical totals. Other providers' archived history is retained; Antigravity records require available source databases to rebuild.
+- Add isolated regression checks for missing steps, repeated references, legacy lookups, inline timestamps and archive migration. Validate SQLite fixture inserts and remove a deprecated test file read.
+
 ## 1.0.3 — 2026-10-19
 
 - Publish local usage before remote quota requests finish, overlap independent quota lookups and coalesce repeated refreshes. Local log changes update statistics without repeatedly querying every quota provider.

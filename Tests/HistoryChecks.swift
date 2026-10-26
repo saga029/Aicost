@@ -45,6 +45,14 @@ struct HistoryChecks {
         let zoned = HistoryResult(days: [summary], sources: [:], updatedAt: utc, warnings: [], timeZoneIdentifier: zoneName)
         let decoded = try JSONDecoder().decode(HistoryResult.self, from: JSONEncoder().encode(zoned))
         assert(decoded.timeZoneIdentifier == zoneName)
+        let staleAntigravityDay = UsageDay(provider: "antigravity", date: "2023-11-14", total: 25)
+        var oldArchive = HistoryResult(days: [summary, staleAntigravityDay], sources: [:], updatedAt: utc, warnings: [])
+        let legacyArchive = try JSONDecoder().decode(HistoryResult.self, from: JSONEncoder().encode(oldArchive))
+        assert(HistoryAnalyzer.restoredDays(from: legacyArchive).map(\.id) == [summary.id],
+               "old Antigravity dates must be rebuilt while other providers retain history")
+        oldArchive.antigravityHistoryVersion = HistoryAnalyzer.antigravityHistoryVersion
+        let currentArchive = try JSONDecoder().decode(HistoryResult.self, from: JSONEncoder().encode(oldArchive))
+        assert(HistoryAnalyzer.restoredDays(from: currentArchive).count == 2, "current archives retain corrected Antigravity history")
         let session = QuotaWindows.reading(id: "session", remaining: 0.15, windowSeconds: 18_000)
         let weekly = QuotaWindows.reading(id: "weekly", remaining: 0, windowSeconds: 604_800)
         let codex = [session, weekly]
@@ -290,10 +298,14 @@ struct HistoryChecks {
         guard inserted == SQLITE_DONE else { throw NSError(domain: "AicostTest", code: 4) }
     }
 
-    static func writeConversationDBWithSteps(_ url: URL, model: String, input: UInt64, output: UInt64, stepIndex: UInt64, timestamp: UInt64) throws {
+    static func writeConversationDBWithSteps(_ url: URL, model: String, input: UInt64, output: UInt64, stepIndex: UInt64, timestamp: UInt64, references: [String]? = nil, includeTarget: Bool = true, inlineTimestamp: UInt64? = nil) throws {
         let usage = Data([0x08]) + varint(input) + Data([0x18]) + varint(output)
-        let lastStepKV = field(1, Data("last_step_index".utf8)) + field(2, Data(String(stepIndex).utf8))
-        let blob = field(1, field(4, usage) + field(19, Data(model.utf8)) + field(20, lastStepKV))
+        let lastSteps = (references ?? [String(stepIndex)]).reduce(into: Data()) { data, value in
+            let entry = field(1, Data("last_step_index".utf8)) + field(2, Data(value.utf8))
+            data.append(field(20, entry))
+        }
+        let stamp = inlineTimestamp.map { field(9, field(4, Data([0x08]) + varint($0))) } ?? Data()
+        let blob = field(1, field(4, usage) + field(19, Data(model.utf8)) + lastSteps + stamp)
         var db: OpaquePointer?
         guard sqlite3_open(url.path, &db) == SQLITE_OK, let db else { throw NSError(domain: "AicostTest", code: 1) }
         defer { sqlite3_close(db) }
@@ -320,11 +332,13 @@ struct HistoryChecks {
             throw NSError(domain: "AicostTest", code: 5)
         }
         defer { sqlite3_finalize(sStmt1) }
-        let _ = oldStepMeta.withUnsafeBytes { raw in
+        let insertedOld = oldStepMeta.withUnsafeBytes { raw -> Int32 in
             let destructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            sqlite3_bind_blob(sStmt1, 1, raw.baseAddress, Int32(oldStepMeta.count), destructor)
-            sqlite3_step(sStmt1)
+            guard sqlite3_bind_blob(sStmt1, 1, raw.baseAddress, Int32(oldStepMeta.count), destructor) == SQLITE_OK else { return SQLITE_ERROR }
+            return sqlite3_step(sStmt1)
         }
+        guard insertedOld == SQLITE_DONE else { throw NSError(domain: "AicostTest", code: 7) }
+        guard includeTarget else { return }
 
         // Step `stepIndex` has the target timestamp
         let targetStepMeta = field(1, Data([0x08]) + varint(timestamp))
@@ -333,12 +347,13 @@ struct HistoryChecks {
             throw NSError(domain: "AicostTest", code: 6)
         }
         defer { sqlite3_finalize(sStmt2) }
-        sqlite3_bind_int64(sStmt2, 1, Int64(stepIndex))
-        let _ = targetStepMeta.withUnsafeBytes { raw in
+        guard sqlite3_bind_int64(sStmt2, 1, Int64(stepIndex)) == SQLITE_OK else { throw NSError(domain: "AicostTest", code: 8) }
+        let insertedTarget = targetStepMeta.withUnsafeBytes { raw -> Int32 in
             let destructor = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
-            sqlite3_bind_blob(sStmt2, 2, raw.baseAddress, Int32(targetStepMeta.count), destructor)
-            sqlite3_step(sStmt2)
+            guard sqlite3_bind_blob(sStmt2, 2, raw.baseAddress, Int32(targetStepMeta.count), destructor) == SQLITE_OK else { return SQLITE_ERROR }
+            return sqlite3_step(sStmt2)
         }
+        guard insertedTarget == SQLITE_DONE else { throw NSError(domain: "AicostTest", code: 9) }
     }
 
     static func checkAntigravitySources(catalog: PriceCatalog) throws {
@@ -354,6 +369,23 @@ struct HistoryChecks {
         try writeConversationDB(client.appendingPathComponent("client.db"), model: "client-model", input: 5, output: 2, timestamp: 1_760_000_000)
         try writeConversationDB(cli.appendingPathComponent("cli.db"), model: "cli-model", input: 9, output: 2, timestamp: 1_760_000_100)
         try writeConversationDBWithSteps(client.appendingPathComponent("steps.db"), model: "step-model", input: 20, output: 5, stepIndex: 50, timestamp: 1_760_000_200)
+        let cases: [(String, [String], Bool, UInt64?, UInt64?)] = [
+            ("missing-step", ["50"], false, nil, nil),
+            ("repeated-step", ["1", "50"], true, nil, 1_760_000_200),
+            ("legacy-step", [], false, nil, 1_700_000_000),
+            ("inline-date", ["50"], false, 1_760_000_300, 1_760_000_300)
+        ]
+        for (name, references, includeTarget, inlineTimestamp, expected) in cases {
+            let url = root.appendingPathComponent(name + ".db")
+            try writeConversationDBWithSteps(url, model: name, input: 20, output: 5, stepIndex: 50,
+                timestamp: 1_760_000_200, references: references, includeTarget: includeTarget, inlineTimestamp: inlineTimestamp)
+            let parsed = HistoryAnalyzer.parseAntigravityDB(url, catalog: catalog)
+            if let expected {
+                assert(parsed.count == 1 && parsed[0].date == Date(timeIntervalSince1970: TimeInterval(expected)), name + " must use the matching timestamp")
+            } else {
+                assert(parsed.isEmpty, "a missing explicit step must not borrow an unrelated row's timestamp")
+            }
+        }
         let home = root.appendingPathComponent("home")
         let roots = HistoryAnalyzer.antigravityConversationRoots(home: home)
         assert(roots.map(\.lastPathComponent) == ["conversations", "conversations", "conversations"])
@@ -412,7 +444,7 @@ struct HistoryChecks {
         let warmStamps = try files.map { try fm.attributesOfItem(atPath: $0.path)[.modificationDate] as! Date }
         assert(warmStamps == stamps, "unchanged logs must reuse their caches")
         for file in files {
-            let text = try String(contentsOf: file)
+            let text = try String(contentsOf: file, encoding: .utf8)
             assert(!text.contains("PRIVATE-CONTENT") && !text.contains("message-private-id"), "caches must contain no conversation body or raw message identity")
         }
         let handle = try FileHandle(forWritingTo: first)

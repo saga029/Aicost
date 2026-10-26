@@ -178,6 +178,7 @@ struct HistoryResult: Codable {
     var updatedAt: Date
     var warnings: [String]
     var timeZoneIdentifier: String? = nil
+    var antigravityHistoryVersion: Int? = nil
 }
 
 // Store diagnostic identities rather than language-specific text. The UI can
@@ -334,6 +335,7 @@ struct PriceCatalog {
 }
 
 enum HistoryAnalyzer {
+    static let antigravityHistoryVersion = 5
     static var zone: TimeZone { .autoupdatingCurrent }
     static var dayFormatter: DateFormatter { dayFormatter(timeZone: zone) }
 
@@ -379,6 +381,12 @@ enum HistoryAnalyzer {
         return aicost
     }
 
+    static func restoredDays(from prior: HistoryResult) -> [UsageDay] {
+        // Old daily buckets can retain incorrectly dated usage even after the
+        // per-file cache is rebuilt. Reconstruct only the affected provider.
+        prior.days.filter { $0.provider != "antigravity" || prior.antigravityHistoryVersion == antigravityHistoryVersion }
+    }
+
     static func collect(apiData: Data?) -> HistoryResult {
         // Freeze the zone for this scan if the device changes zones mid-refresh.
         let collectionZone = TimeZone(identifier: zone.identifier) ?? .current
@@ -392,7 +400,7 @@ enum HistoryAnalyzer {
         var warnings: [String] = []
         var observedCodexPrices: [String: Double] = [:]
         if let data = try? Data(contentsOf: archive), let prior = try? JSONDecoder().decode(HistoryResult.self, from: data) {
-            for day in prior.days { merged[day.id] = day }
+            for day in restoredDays(from: prior) { merged[day.id] = day }
             sources = prior.sources
         }
 
@@ -498,7 +506,8 @@ enum HistoryAnalyzer {
 
         let result = HistoryResult(days: merged.values.sorted { $0.date == $1.date ? $0.provider < $1.provider : $0.date < $1.date },
                                    sources: sources, updatedAt: Date(), warnings: warnings,
-                                   timeZoneIdentifier: collectionZone.identifier)
+                                   timeZoneIdentifier: collectionZone.identifier,
+                                   antigravityHistoryVersion: antigravityHistoryVersion)
         try? FileManager.default.createDirectory(at: archive.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let data = try? JSONEncoder().encode(result) { try? data.write(to: archive, options: .atomic) }
         return result
@@ -536,7 +545,7 @@ enum HistoryAnalyzer {
     }
 
     static func scanAntigravity(catalog: PriceCatalog, support: URL, roots: [URL]? = nil) -> [UsageRecord] {
-        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v4")
+        let cache = storageFolder(support: support).appendingPathComponent("antigravity-db-cache-v\(antigravityHistoryVersion)")
         try? FileManager.default.createDirectory(at: cache, withIntermediateDirectories: true)
         let fm = FileManager.default
         var records: [UsageRecord] = []
@@ -616,6 +625,8 @@ enum HistoryAnalyzer {
             let genData = Data(bytes: blobPtr, count: blobLen)
             var stepData: Data? = nil
             if let stepStmt, let msg1 = pbBytes(1, in: genData) {
+                // Legacy records omit the reference. An explicit reference must
+                // never fall back to a different sequence's coincident index.
                 let stepIdx = pbLastStepIndex(in: msg1) ?? gIdx
                 sqlite3_bind_int64(stepStmt, 1, stepIdx)
                 if sqlite3_step(stepStmt) == SQLITE_ROW, let stepPtr = sqlite3_column_blob(stepStmt, 0) {
@@ -624,16 +635,6 @@ enum HistoryAnalyzer {
                 }
                 sqlite3_reset(stepStmt)
                 sqlite3_clear_bindings(stepStmt)
-
-                if stepData == nil && stepIdx != gIdx {
-                    sqlite3_bind_int64(stepStmt, 1, gIdx)
-                    if sqlite3_step(stepStmt) == SQLITE_ROW, let stepPtr = sqlite3_column_blob(stepStmt, 0) {
-                        let stepLen = Int(sqlite3_column_bytes(stepStmt, 0))
-                        if stepLen > 0 { stepData = Data(bytes: stepPtr, count: stepLen) }
-                    }
-                    sqlite3_reset(stepStmt)
-                    sqlite3_clear_bindings(stepStmt)
-                }
             }
             if let record = decodeAntigravityRow(genData: genData, stepData: stepData, catalog: catalog) {
                 records.append(record)
@@ -779,6 +780,7 @@ enum HistoryAnalyzer {
 
     private static func pbLastStepIndex(in msg1: Data) -> Int64? {
         var idx = 0
+        var lastStepIndex: Int64?
         while idx < msg1.count {
             guard let tag = pbReadVarint(msg1, &idx) else { return nil }
             let field = Int(tag >> 3)
@@ -797,7 +799,7 @@ enum HistoryAnalyzer {
                     if pbString(1, in: sub) == "last_step_index",
                        let valStr = pbString(2, in: sub),
                        let stepIdx = Int64(valStr) {
-                        return stepIdx
+                        lastStepIndex = stepIdx
                     }
                 }
                 idx += length
@@ -808,7 +810,7 @@ enum HistoryAnalyzer {
                 return nil
             }
         }
-        return nil
+        return lastStepIndex
     }
 
     /// Turn totals in `~/.grok/sessions/*/usage.json`. Cached tokens are already inside `inputTokens`,
